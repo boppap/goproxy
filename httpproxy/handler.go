@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -18,11 +19,11 @@ import (
 )
 
 type Handler struct {
-	http.Handler
 	Listener         helpers.Listener
 	RequestFilters   []filters.RequestFilter
 	RoundTripFilters []filters.RoundTripFilter
 	ResponseFilters  []filters.ResponseFilter
+	Branding         string
 }
 
 func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -31,7 +32,7 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	remoteAddr := req.RemoteAddr
 
 	// Prepare filter.Context
-	ctx := filters.NewContext(req.Context(), h, h.Listener, rw)
+	ctx := filters.NewContext(req.Context(), h, h.Listener, rw, h.Branding)
 	req = req.WithContext(ctx)
 
 	// Enable transport http proxy
@@ -65,13 +66,12 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Filter Request
 	for _, f := range h.RequestFilters {
 		ctx, req, err = f.Request(ctx, req)
-		// A roundtrip filter hijacked
-		if filters.GetHijacked(ctx) {
+		if req == filters.DummyRequest {
 			return
 		}
 		if err != nil {
 			if err != io.EOF {
-				glog.Errorf("%s Filter Request %T error: %#v", remoteAddr, f, err)
+				glog.Errorf("%s Filter Request %T error: %+v", remoteAddr, f, err)
 			}
 			return
 		}
@@ -87,15 +87,14 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	var resp *http.Response
 	for _, f := range h.RoundTripFilters {
 		ctx, resp, err = f.RoundTrip(ctx, req)
-		// A roundtrip filter hijacked
-		if filters.GetHijacked(ctx) {
+		if resp == filters.DummyResponse {
 			return
 		}
 		// Unexcepted errors
 		if err != nil {
 			filters.SetRoundTripFilter(ctx, f)
-			glog.Errorf("%s Filter RoundTrip %T error: %v", remoteAddr, f, err)
-			http.Error(rw, fmtError(ctx, err), http.StatusBadGateway)
+			glog.Errorf("%s Filter RoundTrip %T error: %+v", remoteAddr, f, err)
+			http.Error(rw, h.FormatError(ctx, err), http.StatusBadGateway)
 			return
 		}
 		// Update context for request
@@ -110,13 +109,13 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Filter Response
 	for _, f := range h.ResponseFilters {
-		if resp == nil {
+		if resp == nil || resp == filters.DummyResponse {
 			return
 		}
 		ctx, resp, err = f.Response(ctx, resp)
 		if err != nil {
-			glog.Errorln("%s Filter %T Response error: %v", remoteAddr, f, err)
-			http.Error(rw, fmtError(ctx, err), http.StatusBadGateway)
+			glog.Errorln("%s Filter %T Response error: %+v", remoteAddr, f, err)
+			http.Error(rw, h.FormatError(ctx, err), http.StatusBadGateway)
 			return
 		}
 		// Update context for request
@@ -125,10 +124,13 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	if resp == nil {
 		glog.Errorln("%s Handler %#v Response empty response", remoteAddr, h)
-		http.Error(rw, fmtError(ctx, fmt.Errorf("empty response")), http.StatusBadGateway)
+		http.Error(rw, h.FormatError(ctx, fmt.Errorf("empty response")), http.StatusBadGateway)
 		return
 	}
 
+	if resp.Header.Get("Content-Length") == "" && resp.ContentLength >= 0 {
+		resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
 	for key, values := range resp.Header {
 		for _, value := range values {
 			rw.Header().Add(key, value)
@@ -137,27 +139,27 @@ func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(resp.StatusCode)
 	if resp.Body != nil {
 		defer resp.Body.Close()
-		n, err := helpers.IoCopy(rw, resp.Body)
+		n, err := helpers.IOCopy(rw, resp.Body)
 		if err != nil {
 			if isClosedConnError(err) {
-				glog.Infof("IoCopy %#v return %#v %T(%v)", resp.Body, n, err, err)
+				glog.Infof("IOCopy %#v return %#v %T(%v)", resp.Body, n, err, err)
 			} else {
-				glog.Warningf("IoCopy %#v return %#v %T(%v)", resp.Body, n, err, err)
+				glog.Warningf("IOCopy %#v return %#v %T(%v)", resp.Body, n, err, err)
 			}
 		}
 	}
 }
 
-func fmtError(ctx context.Context, err error) string {
+func (h Handler) FormatError(ctx context.Context, err error) string {
 	return fmt.Sprintf(`{
     "type": "localproxy",
     "host": "%s",
-    "software": "go/%s %s/%s",
+    "software": "%s (go/%s %s/%s)",
     "filter": "%T",
     "error": "%s"
 }
 `, filters.GetListener(ctx).Addr().String(),
-		runtime.Version(), runtime.GOOS, runtime.GOARCH,
+		h.Branding, runtime.Version(), runtime.GOOS, runtime.GOARCH,
 		filters.GetRoundTripFilter(ctx),
 		err.Error())
 }

@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/phuslu/glog"
+
 	"../../helpers"
 )
 
@@ -33,16 +35,14 @@ type Servers struct {
 	appids2     []string
 	password    string
 	sslVerify   bool
-	deadline    time.Duration
 }
 
-func NewServers(appids []string, password string, sslVerify bool, deadline time.Duration) *Servers {
+func NewServers(appids []string, password string, sslVerify bool) *Servers {
 	server := &Servers{
 		appids1:   appids,
 		appids2:   []string{},
 		password:  password,
 		sslVerify: sslVerify,
-		deadline:  deadline,
 	}
 	server.perferAppid.Store(server.appids1[0])
 	return server
@@ -50,7 +50,7 @@ func NewServers(appids []string, password string, sslVerify bool, deadline time.
 
 func (s *Servers) ToggleBadAppID(appid string) {
 	s.muAppID.Lock()
-	defer s.muAppID.Lock()
+	defer s.muAppID.Unlock()
 	appids := make([]string, 0)
 	for _, id := range s.appids1 {
 		if id != appid {
@@ -70,7 +70,7 @@ func (s *Servers) ToggleBadServer(fetchserver *url.URL) {
 	s.ToggleBadAppID(strings.TrimSuffix(fetchserver.Host, GAEDomain))
 }
 
-func (s *Servers) EncodeRequest(req *http.Request, fetchserver *url.URL) (*http.Request, error) {
+func (s *Servers) EncodeRequest(req *http.Request, fetchserver *url.URL, deadline time.Duration) (*http.Request, error) {
 	var err error
 	var b bytes.Buffer
 
@@ -84,8 +84,8 @@ func (s *Servers) EncodeRequest(req *http.Request, fetchserver *url.URL) (*http.
 	fmt.Fprintf(w, "%s %s HTTP/1.1\r\n", req.Method, req.URL.String())
 	req.Header.WriteSubset(w, helpers.ReqWriteExcludeHeader)
 	fmt.Fprintf(w, "X-Urlfetch-Password: %s\r\n", s.password)
-	if s.deadline > 0 {
-		fmt.Fprintf(w, "X-Urlfetch-Deadline: %d\r\n", s.deadline/time.Second)
+	if deadline > 0 {
+		fmt.Fprintf(w, "X-Urlfetch-Deadline: %d\r\n", deadline/time.Second)
 	}
 	if s.sslVerify {
 		fmt.Fprintf(w, "X-Urlfetch-SSLVerify: 1\r\n")
@@ -96,13 +96,10 @@ func (s *Servers) EncodeRequest(req *http.Request, fetchserver *url.URL) (*http.
 	binary.BigEndian.PutUint16(b0, uint16(b.Len()))
 
 	req1 := &http.Request{
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Method:     "POST",
-		URL:        fetchserver,
-		Host:       fetchserver.Host,
-		Header:     http.Header{},
+		Method: http.MethodPost,
+		URL:    fetchserver,
+		Host:   fetchserver.Host,
+		Header: http.Header{},
 	}
 
 	if req1.URL.Scheme == "https" {
@@ -155,6 +152,7 @@ func (s *Servers) DecodeResponse(resp *http.Response) (resp1 *http.Response, err
 		}
 
 		if len(parts1) > 1 {
+			glog.Warningf("FetchServer(%+v) is not a goproxy GAE server, please upgrade!", resp.Request.Host)
 			resp1.Header.Del(cookieKey)
 			for i := 0; i < len(parts1); i++ {
 				resp1.Header.Add(cookieKey, parts1[i])

@@ -1,23 +1,26 @@
 #!/bin/bash -xe
 
 export GITHUB_USER=${GITHUB_USER:-phuslu}
+export GITHUB_EMAIL=${GITHUB_EMAIL:-${GITHUB_USER}@noreply.github.com}
 export GITHUB_REPO=${GITHUB_REPO:-goproxy}
 export GITHUB_CI_REPO=${GITHUB_CI_REPO:-goproxy-ci}
 export GITHUB_COMMIT_ID=${TRAVIS_COMMIT:-${COMMIT_ID:-master}}
-export WORKING_DIR=$(pwd)/${GITHUB_REPO}.$(date "+%Y%m%d").${RANDOM:-$$}
-export GOROOT_BOOTSTRAP=${WORKING_DIR}/go1.6
+export WORKING_DIR=$(pwd)/${GITHUB_REPO}.$(date "+%y%m%d").${RANDOM:-$$}
+export GOROOT_BOOTSTRAP=${WORKING_DIR}/goroot_bootstrap
 export GOROOT=${WORKING_DIR}/go
 export GOPATH=${WORKING_DIR}/gopath
 export PATH=$GOROOT/bin:$GOPATH/bin:$PATH
+export GOBRANCH=${GOBRANCH:-master}
+export CGO_ENABLED=${CGO_ENABLED:-0}
 
 if [ ${#GITHUB_TOKEN} -eq 0 ]; then
 	echo "WARNING: \$GITHUB_TOKEN is not set!"
 fi
 
-for CMD in curl awk git tar bzip2 xz 7za gcc make md5sum timeout
+for CMD in curl awk git tar bzip2 xz 7za gcc make sha1sum timeout
 do
 	if ! type -p ${CMD}; then
-		echo "tool ${CMD} is not installed, abort."
+		echo -e "\e[1;31mtool ${CMD} is not installed, abort.\e[0m"
 		exit 1
 	fi
 done
@@ -37,8 +40,8 @@ function rename() {
 function init_github() {
 	pushd ${WORKING_DIR}
 
-	git config --global user.name ${GITHUB_USER}
-	git config --global user.email "${GITHUB_USER}@noreply.github.com"
+	git config --global user.name "${GITHUB_USER}"
+	git config --global user.email "${GITHUB_EMAIL}"
 
 	if ! grep -q 'machine github.com' ~/.netrc; then
 		if [ ${#GITHUB_TOKEN} -gt 0 ]; then
@@ -52,15 +55,15 @@ function init_github() {
 function build_go() {
 	pushd ${WORKING_DIR}
 
-	curl -k https://storage.googleapis.com/golang/go1.6.linux-amd64.tar.gz | tar xz
-	mv go go1.6
+	curl -k https://storage.googleapis.com/golang/go1.7.1.linux-amd64.tar.gz | tar xz
+	mv go goroot_bootstrap
 
-	git clone https://github.com/phuslu/go
+	git clone --branch ${GOBRANCH} https://github.com/phuslu/go
 	cd go/src
 	git remote add -f upstream https://github.com/golang/go
-	git rebase upstream/master
+	git rebase upstream/${GOBRANCH}
 	bash ./make.bash
-	grep -q 'machine github.com' ~/.netrc && git push -f origin master
+	grep -q 'machine github.com' ~/.netrc && git push -f origin ${GOBRANCH}
 
 	(set +x; \
 		echo '================================================================================' ;\
@@ -116,24 +119,33 @@ function build_repo() {
 		git checkout -f pr
 	fi
 
-	export RELEASE=$(git rev-list HEAD| wc -l | xargs)
+	export RELEASE=$(git rev-list --count HEAD)
 	export RELEASE_DESCRIPTION=$(git log -1 --oneline --format="r${RELEASE}: [\`%h\`](https://github.com/${GITHUB_USER}/${GITHUB_REPO}/commit/%h) %s")
 	if [ -n "${TRAVIS_BUILD_ID}" ]; then
 		export RELEASE_DESCRIPTION=$(echo ${RELEASE_DESCRIPTION} | sed -E "s#^(r[0-9]+)#[\1](https://travis-ci.org/${GITHUB_USER}/${GITHUB_REPO}/builds/${TRAVIS_BUILD_ID})#g")
+	fi
+
+	if grep -lr $(printf '\r\n') * | grep '.go$' ; then
+		echo -e "\e[1;31mPlease run dos2unix for go source files\e[0m"
+		exit 1
+	fi
+
+	if [ "$(gofmt -l . | tee /dev/tty)" != "" ]; then
+		echo -e "\e[1;31mPlease run 'gofmt -s -w .' for go source files\e[0m"
+		exit 1
 	fi
 
 	awk 'match($1, /"((github\.com|golang\.org|gopkg\.in)\/.+)"/) {if (!seen[$1]++) {gsub("\"", "", $1); print $1}}' $(find . -name "*.go") | xargs -n1 -i go get -u -v {}
 
 	go test -v ./httpproxy/helpers
 
-	if curl -m 3 https://www.google.com >/dev/null ; then
-		#GoogleG2KeyID=$(curl -s https://pki.google.com/GIAG2.crt | openssl x509 -inform der -pubkey -text | grep -A1 'X509v3 Subject Key Identifier:' | tail -n1 | tr -d ':' | tr '[A-Z]' '[a-z]' | xargs)
-		GoogleG2KeyID=$(openssl s_client -showcerts -connect www.google.com:443 2>/dev/null </dev/null | openssl x509 -text | grep -A1 'X509v3 Authority Key Identifier:' | sed -e 's/keyid://' | tail -n1 | tr -d ':' | tr '[A-Z]' '[a-z]' | xargs)
-		sed -i -r "s/\"GoogleG2KeyID\": \".+\"/\"GoogleG2KeyID\": \"$GoogleG2KeyID\"/g" httpproxy/filters/gae/gae.json
+	if curl -m 3 https://pki.google.com >/dev/null ; then
+		GoogleG2PKP=$(curl -s https://pki.google.com/GIAG2.crt | openssl x509 -inform der -pubkey | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl base64)
+		sed -i -r "s/\"GoogleG2PKP\": \".+\"/\"GoogleG2PKP\": \"$GoogleG2PKP\"/g" httpproxy/filters/gae/gae.json
 		if git status -s | grep -q 'gae.json' ; then
 			git diff
 			git add httpproxy/filters/gae/gae.json
-			git commit -m "update GoogleG2KeyID to $GoogleG2KeyID"
+			git commit -m "update GoogleG2PKP to $GoogleG2PKP"
 			grep -q 'machine github.com' ~/.netrc && git push -f origin master
 		fi
 	fi
@@ -165,15 +177,25 @@ function build_repo() {
 	popd
 }
 
-function release_repo_ci() {
-	if [ ${TRAVIS_EVENT_TYPE:-push} != "push" ]; then
-		return
-	fi
+function build_repo_ex() {
+	pushd ${WORKING_DIR}/${GITHUB_REPO}
 
+	git checkout -f server.vps
+
+	awk 'match($1, /"((github\.com|golang\.org|gopkg\.in)\/.+)"/) {if (!seen[$1]++) {gsub("\"", "", $1); print $1}}' $(find . -name "*.go") | xargs -n1 -i go get -u -v {}
+
+	make
+
+	cp -r $(/bin/ls *.{gz,bz2,xz}) ${WORKING_DIR}/r${RELEASE}
+
+	popd
+}
+
+function release_repo_ci() {
 	pushd ${WORKING_DIR}
 
 	if [ ${#GITHUB_TOKEN} -eq 0 ]; then
-		echo "\$GITHUB_TOKEN is not set, abort"
+		echo -e "\e[1;31m\$GITHUB_TOKEN is not set, abort\e[0m"
 		exit 1
 	fi
 
@@ -221,8 +243,14 @@ function release_repo_ci() {
 }
 
 function clean() {
-	(cd ${WORKING_DIR}/r${RELEASE}/ && ls -lht && sha256sum *)
-	rm -rf ${WORKING_DIR}
+	( set +x ;\
+		cd ${WORKING_DIR}/r${RELEASE}/ ;\
+		ls -lht ;\
+		echo ;\
+		echo 'sha1sum *' ;\
+		sha1sum * | xargs -n1 -i echo -e "\e[1;32m{}\e[0m" ;\
+		rm -rf ${WORKING_DIR} ;\
+	)
 }
 
 init_github
@@ -230,5 +258,8 @@ build_go
 build_glog
 build_http2
 build_repo
-release_repo_ci
+if [ "x${TRAVIS_EVENT_TYPE}" == "xpush" ]; then
+	build_repo_ex
+	release_repo_ci
+fi
 clean

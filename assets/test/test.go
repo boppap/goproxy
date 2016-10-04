@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"net"
 )
 
 func main() {
-	fmt.Printf("%#v\n", "foo")
+	v, err := net.InterfaceAddrs()
+	fmt.Printf("%+v, err=%#v\n", v, err)
 }

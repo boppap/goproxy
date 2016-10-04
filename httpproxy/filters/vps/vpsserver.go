@@ -23,7 +23,7 @@ var (
 	}
 )
 
-type FetchServer struct {
+type Server struct {
 	URL       *url.URL
 	Username  string
 	Password  string
@@ -31,14 +31,14 @@ type FetchServer struct {
 	Transport *http2.Transport
 }
 
-func (f *FetchServer) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+func (f *Server) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	for key, shouldDelete := range reqWriteExcludeHeader {
 		if shouldDelete && req.Header.Get(key) != "" {
 			req.Header.Del(key)
 		}
 	}
 
-	req.Header.Set("Proxy-Authorization", base64.StdEncoding.EncodeToString([]byte(f.Username+":"+f.Password)))
+	req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(f.Username+":"+f.Password)))
 
 	resp, err = f.Transport.RoundTrip(req)
 	if err != nil {
@@ -48,6 +48,6 @@ func (f *FetchServer) RoundTrip(req *http.Request) (resp *http.Response, err err
 	return resp, nil
 }
 
-func (f *FetchServer) Connect(req *http.Request) (conn net.Conn, err error) {
+func (f *Server) Connect(req *http.Request) (conn net.Conn, err error) {
 	return nil, nil
 }

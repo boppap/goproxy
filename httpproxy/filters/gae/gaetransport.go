@@ -8,24 +8,25 @@ import (
 	"net/http"
 	"time"
 
-	"../../dialer"
-	"../../helpers"
-
 	"github.com/phuslu/glog"
+
+	"../../helpers"
 )
 
 type Transport struct {
 	http.RoundTripper
-	MultiDialer *dialer.MultiDialer
+	MultiDialer *helpers.MultiDialer
 	Servers     *Servers
+	Deadline    time.Duration
 	RetryDelay  time.Duration
 	RetryTimes  int
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	deadline := t.Deadline
 	for i := 0; i < t.RetryTimes; i++ {
 		server := t.Servers.PickFetchServer(req, i)
-		req1, err := t.Servers.EncodeRequest(req, server)
+		req1, err := t.Servers.EncodeRequest(req, server, deadline)
 		if err != nil {
 			return nil, fmt.Errorf("GAE EncodeRequest: %s", err.Error())
 		}
@@ -45,8 +46,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 
 			if isTimeoutError {
-				glog.Warningf("GAE: \"%s %s\" timeout: %v, helpers.TryCloseConnections(%T)", req.Method, req.URL.String(), err, t.RoundTripper)
-				helpers.TryCloseConnections(t.RoundTripper)
+				glog.Warningf("GAE: \"%s %s\" timeout: %v, helpers.CloseConnections(%T)", req.Method, req.URL.String(), err, t.RoundTripper)
+				helpers.CloseConnections(t.RoundTripper)
 			}
 
 			if i == t.RetryTimes-1 {
@@ -75,8 +76,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				if t.MultiDialer != nil {
 					if addr, err := helpers.ReflectRemoteAddrFromResponse(resp); err == nil {
 						if ip, _, err := net.SplitHostPort(addr); err == nil {
-							glog.Warningf("GAE: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for 8 hours", ip, resp.StatusCode)
-							t.MultiDialer.IPBlackList.Set(ip, struct{}{}, time.Now().Add(8*time.Hour))
+							duration := 8 * time.Hour
+							glog.Warningf("GAE: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for %v", ip, resp.StatusCode, duration)
+							t.MultiDialer.IPBlackList.Set(ip, struct{}{}, time.Now().Add(duration))
+						}
+						if !helpers.CloseConnectionByRemoteAddr(t.RoundTripper, addr) {
+							glog.Warningf("GAE: CloseConnectionByRemoteAddr(%T, %#v) failed.", t.RoundTripper, addr)
 						}
 					}
 				}
@@ -107,14 +112,15 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			resp1.Body.Close()
 			switch {
 			case bytes.Contains(body, []byte("DEADLINE_EXCEEDED")):
-				glog.V(2).Infof("GAE: %s urlfetch %#v get DEADLINE_EXCEEDED, retry...", req1.Host, req.URL.String())
+				//FIXME: deadline += 10 * time.Second
+				glog.Warningf("GAE: %s urlfetch %#v get DEADLINE_EXCEEDED, retry with deadline=%s...", req1.Host, req.URL.String(), deadline)
 				continue
 			case bytes.Contains(body, []byte("ver quota")):
-				glog.V(2).Infof("GAE: %s urlfetch %#v get over quota, retry...", req1.Host, req.URL.String())
+				glog.Warningf("GAE: %s urlfetch %#v get over quota, retry...", req1.Host, req.URL.String())
 				time.Sleep(t.RetryDelay)
 				continue
 			case bytes.Contains(body, []byte("urlfetch: CLOSED")):
-				glog.V(2).Infof("GAE: %s urlfetch %#v get urlfetch: CLOSED, retry...", req1.Host, req.URL.String())
+				glog.Warningf("GAE: %s urlfetch %#v get urlfetch: CLOSED, retry...", req1.Host, req.URL.String())
 				time.Sleep(t.RetryDelay)
 				continue
 			default:

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/hex"
+	"encoding/base64"
+	"flag"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,9 +18,9 @@ import (
 	"github.com/phuslu/glog"
 	"github.com/phuslu/net/http2"
 
-	"../../dialer"
 	"../../filters"
 	"../../helpers"
+	"../../proxy"
 	"../../storage"
 )
 
@@ -29,11 +32,13 @@ type Config struct {
 	AppIDs          []string
 	Password        string
 	SSLVerify       bool
+	DisableIPv6     bool
 	ForceIPv6       bool
 	DisableHTTP2    bool
 	ForceHTTP2      bool
 	EnableDeadProbe bool
-	Sites           []string
+	EnableRemoteDNS bool
+	SiteToAlias     map[string]string
 	Site2Alias      map[string]string
 	HostMap         map[string][]string
 	TLSConfig       struct {
@@ -43,14 +48,12 @@ type Config struct {
 		Ciphers                []string
 		ServerName             []string
 	}
-	GoogleG2KeyID string
-	ForceHTTPS    []string
-	ForceGAE      []string
-	ForceDeflate  []string
-	FakeOptions   map[string][]string
-	DNSServers    []string
-	IPBlackList   []string
-	Transport     struct {
+	GoogleG2PKP string
+	ForceGAE    []string
+	FakeOptions map[string][]string
+	DNSServers  []string
+	IPBlackList []string
+	Transport   struct {
 		Dialer struct {
 			DNSCacheExpiry   int
 			DNSCacheSize     uint
@@ -59,6 +62,10 @@ type Config struct {
 			KeepAlive        int
 			Level            int
 			Timeout          int
+		}
+		Proxy struct {
+			Enabled bool
+			URL     string
 		}
 		DisableCompression    bool
 		DisableKeepAlives     bool
@@ -72,23 +79,21 @@ type Config struct {
 
 type Filter struct {
 	Config
-	MultiDialer         *dialer.MultiDialer
-	GAETransport        *Transport
-	DirectTransport     http.RoundTripper
-	ForceHTTPSMatcher   *helpers.HostMatcher
-	ForceGAEStrings     []string
-	ForceGAESuffixs     []string
-	ForceGAEMatcher     *helpers.HostMatcher
-	ForceDeflateMatcher *helpers.HostMatcher
-	FakeOptionsMatcher  *helpers.HostMatcher
-	SiteMatcher         *helpers.HostMatcher
-	DirectSiteMatcher   *helpers.HostMatcher
+	GAETransport       *Transport
+	DirectTransport    http.RoundTripper
+	ForceHTTPSMatcher  *helpers.HostMatcher
+	ForceGAEStrings    []string
+	ForceGAESuffixs    []string
+	ForceGAEMatcher    *helpers.HostMatcher
+	FakeOptionsMatcher *helpers.HostMatcher
+	SiteMatcher        *helpers.HostMatcher
+	DirectSiteMatcher  *helpers.HostMatcher
 }
 
 func init() {
 	filename := filterName + ".json"
 	config := new(Config)
-	err := storage.ReadJsonConfig(storage.LookupConfigStoreURI(filterName), filename, config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
 		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
@@ -112,8 +117,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		}
 	}
 
-	// curl -s https://pki.google.com/GIAG2.crt | openssl x509 -inform der -pubkey -text
-	googleG2KeyID, err := hex.DecodeString(config.GoogleG2KeyID)
+	GoogleG2PKP, err := base64.StdEncoding.DecodeString(config.GoogleG2PKP)
 	if err != nil {
 		return nil, err
 	}
@@ -184,42 +188,66 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		googleTLSConfig.NextProtos = []string{"h2", "h2-14", "http/1.1"}
 	}
 
-	d := &dialer.MultiDialer{
-		Dialer: net.Dialer{
-			KeepAlive: time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
-			Timeout:   time.Duration(config.Transport.Dialer.Timeout) * time.Second,
-			DualStack: config.Transport.Dialer.DualStack,
-		},
-		ForceIPv6:         config.ForceIPv6,
+	if config.Site2Alias == nil {
+		config.Site2Alias = make(map[string]string)
+	}
+	for key, value := range config.SiteToAlias {
+		config.Site2Alias[key] = value
+	}
+	config.SiteToAlias = config.Site2Alias
+
+	hostmap := map[string][]string{}
+	for key, value := range config.HostMap {
+		hostmap[key] = helpers.UniqueStrings(value)
+	}
+
+	d := &net.Dialer{
+		KeepAlive: time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
+		Timeout:   time.Duration(config.Transport.Dialer.Timeout) * time.Second,
+		DualStack: config.Transport.Dialer.DualStack,
+	}
+
+	r := &helpers.Resolver{
+		LRUCache:    lrucache.NewLRUCache(config.Transport.Dialer.DNSCacheSize),
+		DNSExpiry:   time.Duration(config.Transport.Dialer.DNSCacheExpiry) * time.Second,
+		DisableIPv6: config.DisableIPv6,
+		ForceIPv6:   config.ForceIPv6,
+	}
+
+	if config.EnableRemoteDNS {
+		r.DNSServer = net.ParseIP(config.DNSServers[0])
+		if r.DNSServer == nil {
+			glog.Fatalf("net.ParseIP(%+v) failed: %s", config.DNSServers[0], err)
+		}
+	}
+
+	md := &helpers.MultiDialer{
+		Dialer:            d,
+		Resolver:          r,
 		SSLVerify:         config.SSLVerify,
+		LogToStderr:       flag.Lookup("logtostderr") != nil,
 		TLSConfig:         nil,
-		Site2Alias:        helpers.NewHostMatcherWithString(config.Site2Alias),
-		IPBlackList:       lrucache.NewLRUCache(8192),
-		HostMap:           config.HostMap,
+		SiteToAlias:       helpers.NewHostMatcherWithString(config.SiteToAlias),
+		IPBlackList:       lrucache.NewLRUCache(1024),
+		HostMap:           hostmap,
 		GoogleTLSConfig:   googleTLSConfig,
-		GoogleG2KeyID:     googleG2KeyID,
-		DNSServers:        dnsServers,
-		DNSCache:          lrucache.NewLRUCache(config.Transport.Dialer.DNSCacheSize),
-		DNSCacheExpiry:    time.Duration(config.Transport.Dialer.DNSCacheExpiry) * time.Second,
-		TCPConnDuration:   lrucache.NewLRUCache(8192),
-		TCPConnError:      lrucache.NewLRUCache(8192),
+		GoogleG2PKP:       GoogleG2PKP,
 		TLSConnDuration:   lrucache.NewLRUCache(8192),
 		TLSConnError:      lrucache.NewLRUCache(8192),
-		TCPConnReadBuffer: config.Transport.Dialer.SocketReadBuffer,
 		TLSConnReadBuffer: config.Transport.Dialer.SocketReadBuffer,
 		ConnExpiry:        5 * time.Minute,
 		Level:             config.Transport.Dialer.Level,
 	}
 
 	for _, ip := range config.IPBlackList {
-		d.IPBlackList.Set(ip, struct{}{}, time.Time{})
+		md.IPBlackList.Set(ip, struct{}{}, time.Time{})
 	}
 
 	var tr http.RoundTripper
 
 	t1 := &http.Transport{
-		Dial:                  d.Dial,
-		DialTLS:               d.DialTLS,
+		Dial:                  md.Dial,
+		DialTLS:               md.DialTLS,
 		DisableKeepAlives:     config.Transport.DisableKeepAlives,
 		DisableCompression:    config.Transport.DisableCompression,
 		ResponseHeaderTimeout: time.Duration(config.Transport.ResponseHeaderTimeout) * time.Second,
@@ -227,17 +255,34 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		MaxIdleConnsPerHost:   config.Transport.MaxIdleConnsPerHost,
 	}
 
-	t2 := &http2.Transport{
-		DialTLS:            d.DialTLS2,
-		TLSClientConfig:    d.GoogleTLSConfig,
-		DisableCompression: config.Transport.DisableCompression,
+	if config.Transport.Proxy.Enabled {
+		fixedURL, err := url.Parse(config.Transport.Proxy.URL)
+		if err != nil {
+			glog.Fatalf("url.Parse(%#v) error: %s", config.Transport.Proxy.URL, err)
+		}
+
+		dialer, err := proxy.FromURL(fixedURL, d, &helpers.MultiResolver{md})
+		if err != nil {
+			glog.Fatalf("proxy.FromURL(%#v) error: %s", fixedURL.String(), err)
+		}
+
+		t1.Dial = dialer.Dial
+		t1.DialTLS = nil
+		t1.Proxy = nil
+		t1.TLSClientConfig = md.GoogleTLSConfig
 	}
 
 	switch {
 	case config.DisableHTTP2 && config.ForceHTTP2:
-		glog.Fatalf("GAE: DisableHTTP2=%v and ForceHTTPS=%v is conflict!", config.DisableHTTP2, config.ForceHTTP2)
+		glog.Fatalf("GAE: DisableHTTP2=%v and ForceHTTP2=%v is conflict!", config.DisableHTTP2, config.ForceHTTP2)
+	case config.Transport.Proxy.Enabled && config.ForceHTTP2:
+		glog.Fatalf("GAE: Proxy.Enabled=%v and ForceHTTP2=%v is conflict!", config.Transport.Proxy.Enabled, config.ForceHTTP2)
 	case config.ForceHTTP2:
-		tr = t2
+		tr = &http2.Transport{
+			DialTLS:            md.DialTLS2,
+			TLSClientConfig:    md.GoogleTLSConfig,
+			DisableCompression: config.Transport.DisableCompression,
+		}
 	case !config.DisableHTTP2:
 		err := http2.ConfigureTransport(t1)
 		if err != nil {
@@ -246,6 +291,13 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		tr = t1
 	default:
 		tr = t1
+	}
+
+	forceHTTPSMatcherStrings := make([]string, 0)
+	for key, value := range config.SiteToAlias {
+		if strings.HasPrefix(value, "google_") {
+			forceHTTPSMatcherStrings = append(forceHTTPSMatcherStrings, key)
+		}
 	}
 
 	forceGAEStrings := make([]string, 0)
@@ -263,7 +315,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		}
 	}
 
-	if config.EnableDeadProbe {
+	if config.EnableDeadProbe && !config.Transport.Proxy.Enabled {
 		go func() {
 			probe := func() {
 				req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
@@ -273,13 +325,20 @@ func NewFilter(config *Config) (filters.Filter, error) {
 				resp, err := tr.RoundTrip(req)
 				if resp != nil && resp.Body != nil {
 					glog.V(3).Infof("GAE EnableDeadProbe \"%s %s\" %d -", req.Method, req.URL.String(), resp.StatusCode)
-					resp.Body.Close()
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusBadGateway {
+						if ip, err := helpers.ReflectRemoteIPFromResponse(resp); err == nil && ip != nil {
+							duration := 1 * time.Hour
+							glog.Warningf("GAE EnableDeadProbe: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for %v", ip, resp.StatusCode, duration)
+							md.IPBlackList.Set(ip.String(), struct{}{}, time.Now().Add(duration))
+						}
+					}
 				}
 				if err != nil {
 					glog.V(2).Infof("GAE EnableDeadProbe \"%s %s\" error: %v", req.Method, req.URL.String(), err)
 					s := strings.ToLower(err.Error())
 					if strings.HasPrefix(s, "net/http: request canceled") || strings.Contains(s, "timeout") {
-						helpers.TryCloseConnections(tr)
+						helpers.CloseConnections(tr)
 					}
 				}
 			}
@@ -293,29 +352,30 @@ func NewFilter(config *Config) (filters.Filter, error) {
 
 	helpers.ShuffleStrings(config.AppIDs)
 
-	return &Filter{
-		Config:      *config,
-		MultiDialer: d,
+	f := &Filter{
+		Config: *config,
 		GAETransport: &Transport{
 			RoundTripper: tr,
-			MultiDialer:  d,
-			Servers: NewServers(config.AppIDs,
-				config.Password,
-				config.SSLVerify,
-				time.Duration(config.Transport.ResponseHeaderTimeout-4)*time.Second),
-			RetryDelay: time.Duration(config.Transport.RetryDelay*1000) * time.Second,
-			RetryTimes: config.Transport.RetryTimes,
+			MultiDialer:  md,
+			Servers:      NewServers(config.AppIDs, config.Password, config.SSLVerify),
+			Deadline:     time.Duration(config.Transport.ResponseHeaderTimeout-2) * time.Second,
+			RetryDelay:   time.Duration(config.Transport.RetryDelay*1000) * time.Second,
+			RetryTimes:   config.Transport.RetryTimes,
 		},
-		DirectTransport:     tr,
-		ForceHTTPSMatcher:   helpers.NewHostMatcher(config.ForceHTTPS),
-		ForceGAEMatcher:     helpers.NewHostMatcher(forceGAEMatcherStrings),
-		ForceGAEStrings:     forceGAEStrings,
-		ForceGAESuffixs:     forceGAESuffixs,
-		ForceDeflateMatcher: helpers.NewHostMatcher(config.ForceDeflate),
-		FakeOptionsMatcher:  helpers.NewHostMatcherWithStrings(config.FakeOptions),
-		SiteMatcher:         helpers.NewHostMatcher(config.Sites),
-		DirectSiteMatcher:   helpers.NewHostMatcherWithString(config.Site2Alias),
-	}, nil
+		DirectTransport:    tr,
+		ForceHTTPSMatcher:  helpers.NewHostMatcher(forceHTTPSMatcherStrings),
+		ForceGAEMatcher:    helpers.NewHostMatcher(forceGAEMatcherStrings),
+		ForceGAEStrings:    forceGAEStrings,
+		ForceGAESuffixs:    forceGAESuffixs,
+		FakeOptionsMatcher: helpers.NewHostMatcherWithStrings(config.FakeOptions),
+		DirectSiteMatcher:  helpers.NewHostMatcherWithString(config.Site2Alias),
+	}
+
+	if config.Transport.Proxy.Enabled {
+		f.GAETransport.MultiDialer = nil
+	}
+
+	return f, nil
 }
 
 func (f *Filter) FilterName() string {
@@ -323,10 +383,6 @@ func (f *Filter) FilterName() string {
 }
 
 func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
-	if !f.SiteMatcher.Match(req.Host) {
-		return ctx, nil, nil
-	}
-
 	var tr http.RoundTripper = f.GAETransport
 
 	if req.URL.Scheme == "http" && f.ForceHTTPSMatcher.Match(req.Host) {
@@ -334,11 +390,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 			u := strings.Replace(req.URL.String(), "http://", "https://", 1)
 			glog.V(2).Infof("GAE FORCEHTTPS get raw url=%v, redirect to %v", req.URL.String(), u)
 			resp := &http.Response{
-				Status:     "301 Moved Permanently",
 				StatusCode: http.StatusMovedPermanently,
-				Proto:      "HTTP/1.1",
-				ProtoMajor: 1,
-				ProtoMinor: 1,
 				Header: http.Header{
 					"Location": []string{u},
 				},
@@ -352,17 +404,33 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 	}
 
 	if f.DirectSiteMatcher.Match(req.Host) {
-		if req.URL.Path == "/url" {
-			if u := req.URL.Query().Get("url"); u != "" {
-				glog.V(2).Infof("GAE REDIRECT get raw url=%v, redirect to %v", req.URL.String(), u)
+		switch req.URL.Path {
+		case "/url":
+			if rawurl := req.URL.Query().Get("url"); rawurl != "" {
+				if u, err := url.Parse(rawurl); err == nil {
+					if u.Scheme == "http" && f.ForceHTTPSMatcher.Match(u.Host) {
+						rawurl = strings.Replace(rawurl, "http://", "https://", 1)
+					}
+				}
+				glog.V(2).Infof("%s \"GAE REDIRECT %s %s %s\" - -", req.RemoteAddr, req.Method, rawurl, req.Proto)
 				return ctx, &http.Response{
-					Status:     "302 Found",
 					StatusCode: http.StatusFound,
-					Proto:      "HTTP/1.1",
-					ProtoMajor: 1,
-					ProtoMinor: 1,
 					Header: http.Header{
-						"Location": []string{u},
+						"Location": []string{rawurl},
+					},
+					Request:       req,
+					Close:         true,
+					ContentLength: -1,
+				}, nil
+			}
+		case "/books":
+			if req.URL.Host == "books.google.cn" {
+				rawurl := strings.Replace(req.URL.String(), "books.google.cn", "books.google.com", 1)
+				glog.V(2).Infof("%s \"GAE REDIRECT %s %s %s\" - -", req.RemoteAddr, req.Method, rawurl, req.Proto)
+				return ctx, &http.Response{
+					StatusCode: http.StatusFound,
+					Header: http.Header{
+						"Location": []string{rawurl},
 					},
 					Request:       req,
 					Close:         true,
@@ -384,11 +452,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 	if tr != f.DirectTransport && req.Method == http.MethodOptions {
 		if v, ok := f.FakeOptionsMatcher.Lookup(req.Host); ok {
 			resp := &http.Response{
-				Status:        "200 OK",
 				StatusCode:    http.StatusOK,
-				Proto:         "HTTP/1.1",
-				ProtoMajor:    1,
-				ProtoMinor:    1,
 				Header:        http.Header{},
 				Request:       req,
 				Close:         false,
@@ -411,6 +475,23 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 	}
 
+	if tr == f.GAETransport {
+		switch strings.ToLower(req.Header.Get("Connection")) {
+		case "upgrade":
+			resp := &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header: http.Header{
+					"X-WebSocket-Reject-Reason": []string{"Unsupported"},
+				},
+				Request:       req,
+				Close:         true,
+				ContentLength: 0,
+			}
+			glog.V(2).Infof("%s \"GAE FAKEWEBSOCKET %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
+			return ctx, resp, nil
+		}
+	}
+
 	prefix := "FETCH"
 	if tr == f.DirectTransport {
 		prefix = "DIRECT"
@@ -424,7 +505,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 				Timeout() bool
 			}); ok && ne.Timeout() {
 				// f.MultiDialer.ClearCache()
-				helpers.TryCloseConnections(tr)
+				helpers.CloseConnections(tr)
 			}
 		}
 		if resp != nil && resp.Body != nil {
@@ -433,23 +514,39 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		return ctx, nil, err
 	}
 
-	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/") &&
-		resp.Header.Get("Content-Encoding") == "" &&
-		f.ForceDeflateMatcher.Match(req.Host) {
-		buf := make([]byte, 1024)
-		n, err := resp.Body.Read(buf)
+	if tr == f.DirectTransport && resp.StatusCode >= http.StatusBadRequest {
+		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			defer resp.Body.Close()
+			resp.Body.Close()
 			return ctx, nil, err
 		}
-		buf = buf[:n]
-		switch {
-		case helpers.IsGzip(buf):
-			resp.Header.Set("Content-Encoding", "gzip")
-		case helpers.IsBinary(buf):
-			resp.Header.Set("Content-Encoding", "deflate")
+		if addr, err := helpers.ReflectRemoteAddrFromResponse(resp); err == nil {
+			if ip, _, err := net.SplitHostPort(addr); err == nil {
+				var duration time.Duration
+				switch {
+				case resp.StatusCode == http.StatusBadGateway && bytes.Contains(body, []byte("Please try again in 30 seconds.")):
+					duration = 1 * time.Hour
+				case resp.StatusCode == http.StatusNotFound && bytes.Contains(body, []byte("<ins>That’s all we know.</ins>")):
+					server := resp.Header.Get("Server")
+					if server != "gws" && !strings.HasPrefix(server, "gvs") {
+						if md := f.GAETransport.MultiDialer; md != nil && md.TLSConnDuration.Len() > 10 {
+							duration = 5 * time.Minute
+						}
+					}
+				}
+
+				if duration > 0 && f.GAETransport.MultiDialer != nil {
+					glog.Warningf("GAE: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for %v", ip, resp.StatusCode, duration)
+					f.GAETransport.MultiDialer.IPBlackList.Set(ip, struct{}{}, time.Now().Add(duration))
+
+					if !helpers.CloseConnectionByRemoteAddr(tr, addr) {
+						glog.Warningf("GAE: CloseConnectionByRemoteAddr(%T, %#v) failed.", tr, addr)
+					}
+				}
+			}
 		}
-		resp.Body = helpers.NewMultiReadCloser(bytes.NewReader(buf), resp.Body)
+		resp.Body.Close()
+		resp.Body = ioutil.NopCloser(bytes.NewReader(body))
 	}
 
 	if resp != nil && resp.Header != nil {

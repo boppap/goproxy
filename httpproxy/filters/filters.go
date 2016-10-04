@@ -4,6 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
+)
+
+var (
+	DummyRequest  *http.Request  = &http.Request{}
+	DummyResponse *http.Response = &http.Response{}
 )
 
 type Filter interface {
@@ -11,17 +17,17 @@ type Filter interface {
 }
 
 type RequestFilter interface {
-	FilterName() string
+	Filter
 	Request(context.Context, *http.Request) (context.Context, *http.Request, error)
 }
 
 type RoundTripFilter interface {
-	FilterName() string
+	Filter
 	RoundTrip(context.Context, *http.Request) (context.Context, *http.Response, error)
 }
 
 type ResponseFilter interface {
-	FilterName() string
+	Filter
 	Response(context.Context, *http.Response) (context.Context, *http.Response, error)
 }
 
@@ -31,11 +37,14 @@ type RegisteredFilter struct {
 
 var (
 	registeredFilters map[string]*RegisteredFilter
-	filters           map[string]Filter
+	newedFilters      map[string]Filter
+	muFilters         map[string]*sync.Mutex
 )
 
 func init() {
 	registeredFilters = make(map[string]*RegisteredFilter)
+	newedFilters = make(map[string]Filter)
+	muFilters = make(map[string]*sync.Mutex)
 }
 
 // Register a Filter
@@ -45,23 +54,30 @@ func Register(name string, registeredFilter *RegisteredFilter) error {
 	}
 
 	registeredFilters[name] = registeredFilter
+	muFilters[name] = new(sync.Mutex)
 	return nil
-}
-
-// NewFilter creates a new Filter of type "name"
-func NewFilter(name string) (Filter, error) {
-	filter, exists := registeredFilters[name]
-	if !exists {
-		return nil, fmt.Errorf("registeredFilters: Unknown filter %q", name)
-	}
-	return filter.New()
 }
 
 // GetFilter try get a existing Filter of type "name", otherwise create new one
 func GetFilter(name string) (Filter, error) {
-	filter, exists := filters[name]
-	if exists {
-		return filter, nil
+	muFilters[name].Lock()
+	defer muFilters[name].Unlock()
+
+	if f, ok := newedFilters[name]; ok {
+		return f, nil
 	}
-	return NewFilter(name)
+
+	filterNew, ok := registeredFilters[name]
+	if !ok {
+		return nil, fmt.Errorf("registeredFilters: Unknown filter %q", name)
+	}
+
+	filter, err := filterNew.New()
+	if err != nil {
+		return nil, err
+	}
+
+	newedFilters[name] = filter
+
+	return filter, nil
 }

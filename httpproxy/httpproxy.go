@@ -20,6 +20,7 @@ import (
 	_ "./filters/php"
 	_ "./filters/ratelimit"
 	_ "./filters/rewrite"
+	_ "./filters/ssh2"
 	_ "./filters/stripssl"
 	_ "./filters/vps"
 )
@@ -43,14 +44,14 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 
 	filename := "httpproxy.json"
-	err := storage.ReadJsonConfig(storage.LookupConfigStoreURI("httpproxy"), filename, &Config)
+	err := storage.LookupStoreByFilterName("httpproxy").UnmarshallJson(filename, &Config)
 	if err != nil {
 		fmt.Printf("storage.ReadJsonConfig(%#v) failed: %s\n", filename, err)
 		return
 	}
 }
 
-func ServeProfile(profile string) error {
+func ServeProfile(profile string, branding string) error {
 	config, ok := Config[profile]
 	if !ok {
 		return fmt.Errorf("profile(%#v) not exists", profile)
@@ -70,6 +71,7 @@ func ServeProfile(profile string) error {
 		RequestFilters:   requestFilters,
 		RoundTripFilters: roundtripFilters,
 		ResponseFilters:  responseFilters,
+		Branding:         branding,
 	}
 
 	s := &http.Server{

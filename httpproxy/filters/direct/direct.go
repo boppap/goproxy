@@ -1,21 +1,20 @@
 package direct
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
 	"github.com/phuslu/glog"
 
-	"../../dialer"
 	"../../filters"
 	"../../helpers"
+	"../../proxy"
 	"../../storage"
 )
 
@@ -29,10 +28,12 @@ type Config struct {
 			Timeout        int
 			KeepAlive      int
 			DualStack      bool
-			RetryTimes     int
-			RetryDelay     float32
 			DNSCacheExpiry int
 			DNSCacheSize   uint
+		}
+		Proxy struct {
+			Enabled bool
+			URL     string
 		}
 		TLSClientConfig struct {
 			InsecureSkipVerify     bool
@@ -54,7 +55,7 @@ type Filter struct {
 func init() {
 	filename := filterName + ".json"
 	config := new(Config)
-	err := storage.ReadJsonConfig(storage.LookupConfigStoreURI(filterName), filename, config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
 		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
 	}
@@ -71,28 +72,25 @@ func init() {
 }
 
 func NewFilter(config *Config) (filters.Filter, error) {
-	d := &dialer.Dialer{
-		Dialer: net.Dialer{
+	d := &helpers.Dialer{
+		Dialer: &net.Dialer{
 			KeepAlive: time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
 			Timeout:   time.Duration(config.Transport.Dialer.Timeout) * time.Second,
 			DualStack: config.Transport.Dialer.DualStack,
 		},
-		RetryTimes:     config.Transport.Dialer.RetryTimes,
-		RetryDelay:     time.Duration(config.Transport.Dialer.RetryDelay*1000) * time.Second,
-		DNSCache:       lrucache.NewLRUCache(config.Transport.Dialer.DNSCacheSize),
-		DNSCacheExpiry: time.Duration(config.Transport.Dialer.DNSCacheExpiry) * time.Second,
-		LoopbackAddrs:  make(map[string]struct{}),
+		Resolver: &helpers.Resolver{
+			LRUCache:  lrucache.NewLRUCache(config.Transport.Dialer.DNSCacheSize),
+			DNSExpiry: time.Duration(config.Transport.Dialer.DNSCacheExpiry) * time.Second,
+			BlackList: lrucache.NewLRUCache(1024),
+		},
 	}
 
-	d.LoopbackAddrs = make(map[string]struct{})
-	d.LoopbackAddrs["127.0.0.1"] = struct{}{}
-	d.LoopbackAddrs["::1"] = struct{}{}
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, addr := range addrs {
-			switch addr.Network() {
-			case "ip":
-				d.LoopbackAddrs[addr.String()] = struct{}{}
-			}
+	if ips, err := helpers.LocalIPv4s(); err == nil {
+		for _, ip := range ips {
+			d.Resolver.BlackList.Set(ip.String(), struct{}{}, time.Time{})
+		}
+		for _, s := range []string{"127.0.0.1", "::1"} {
+			d.Resolver.BlackList.Set(s, struct{}{}, time.Time{})
 		}
 	}
 
@@ -105,6 +103,29 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		TLSHandshakeTimeout: time.Duration(config.Transport.TLSHandshakeTimeout) * time.Second,
 		MaxIdleConnsPerHost: config.Transport.MaxIdleConnsPerHost,
 		DisableCompression:  config.Transport.DisableCompression,
+	}
+
+	if config.Transport.Proxy.Enabled {
+		fixedURL, err := url.Parse(config.Transport.Proxy.URL)
+		if err != nil {
+			glog.Fatalf("url.Parse(%#v) error: %s", config.Transport.Proxy.URL, err)
+		}
+
+		switch fixedURL.Scheme {
+		case "http", "https":
+			tr.Proxy = http.ProxyURL(fixedURL)
+			tr.Dial = nil
+			tr.DialTLS = nil
+		default:
+			dialer, err := proxy.FromURL(fixedURL, d, nil)
+			if err != nil {
+				glog.Fatalf("proxy.FromURL(%#v) error: %s", fixedURL.String(), err)
+			}
+
+			tr.Dial = dialer.Dial
+			tr.DialTLS = nil
+			tr.Proxy = nil
+		}
 	}
 
 	return &Filter{
@@ -147,36 +168,22 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 		defer lconn.Close()
 
-		go helpers.IoCopy(rconn, lconn)
-		helpers.IoCopy(lconn, rconn)
+		go helpers.IOCopy(rconn, lconn)
+		helpers.IOCopy(lconn, rconn)
 
-		filters.SetHijacked(ctx, true)
-		return ctx, nil, nil
+		return ctx, filters.DummyResponse, nil
 	default:
 		helpers.FixRequestURL(req)
 		resp, err := f.transport.RoundTrip(req)
 
 		if err != nil {
-			glog.Errorf("%s \"DIRECT %s %s %s\" error: %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, err)
-			data := err.Error()
-			resp = &http.Response{
-				Status:        "502 Bad Gateway",
-				StatusCode:    http.StatusBadGateway,
-				Proto:         "HTTP/1.1",
-				ProtoMajor:    1,
-				ProtoMinor:    1,
-				Header:        http.Header{},
-				Request:       req,
-				Close:         true,
-				ContentLength: int64(len(data)),
-				Body:          ioutil.NopCloser(bytes.NewReader([]byte(data))),
-			}
-			err = nil
-		} else {
-			if req.RemoteAddr != "" {
-				glog.V(2).Infof("%s \"DIRECT %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
-			}
+			return ctx, nil, err
 		}
+
+		if req.RemoteAddr != "" {
+			glog.V(2).Infof("%s \"DIRECT %s %s %s\" %d %s", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, resp.Header.Get("Content-Length"))
+		}
+
 		return ctx, resp, err
 	}
 }

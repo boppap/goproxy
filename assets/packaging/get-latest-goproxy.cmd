@@ -5,21 +5,24 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
-wmic ComputerSystem Get UserName
-
-echo. >~gdownload.vbs
-echo Set Http = CreateObject("WinHttp.WinHttpRequest.5.1") >>~gdownload.vbs
-echo Set Stream = CreateObject("Adodb.Stream") >>~gdownload.vbs
-echo Http.SetTimeouts 30*1000, 30*1000, 30*1000, 120*1000  >>~gdownload.vbs
+echo. >~.txt
+echo Set Http = CreateObject("WinHttp.WinHttpRequest.5.1") >>~.txt
+echo Set Stream = CreateObject("Adodb.Stream") >>~.txt
+echo Http.SetTimeouts 30*1000, 30*1000, 30*1000, 120*1000  >>~.txt
 netstat -an| findstr LISTENING | findstr ":8087" >NUL && (
-    echo Http.SetProxy 2, "127.0.0.1:8087", "" >>~gdownload.vbs
+    echo Http.SetProxy 2, "127.0.0.1:8087", "" >>~.txt
 )
-echo Http.Open "GET", WScript.Arguments.Item(0), False >>~gdownload.vbs
-echo Http.Send >>~gdownload.vbs
-echo Stream.Type = 1 >>~gdownload.vbs
-echo Stream.Open >>~gdownload.vbs
-echo Stream.Write Http.ResponseBody >>~gdownload.vbs
-echo Stream.SaveToFile WScript.Arguments.Item(1), 2 >>~gdownload.vbs
+echo Http.Open "GET", WScript.Arguments.Item(0), False >>~.txt
+echo Http.Send >>~.txt
+echo Http.WaitForResponse 5 >>~.txt
+echo If Not Http.Status = 200 then >>~.txt
+echo     WScript.Quit 1 >>~.txt
+echo End If >>~.txt
+echo Stream.Type = 1 >>~.txt
+echo Stream.Open >>~.txt
+echo Stream.Write Http.ResponseBody >>~.txt
+echo Stream.SaveToFile WScript.Arguments.Item(1), 2 >>~.txt
+move /y ~.txt ~gdownload.vbs >NUL
 
 
 set has_user_json=0
@@ -33,78 +36,99 @@ if exist "httpproxy.json" (
     )
 )
 
-set filename_pattern=goproxy_windows_386
-if exist "%systemdrive%\Program Files (x86)" (
-    set filename_pattern=goproxy_windows_amd64
+forfiles /? 1>NUL 2>NUL && (
+    forfiles /P cache /M *.crt /D -90 /C "cmd /c del /f @path" 2>NUL
 )
 
+for %%I in (*.user.json) do (
+    set USER_JSON_FILE=%%I
+    set /p USER_JSON_LINE= <!USER_JSON_FILE!
+    echo "!USER_JSON_LINE!" | findstr "AUTO_UPDATE_URL" 1>NUL && (
+        set USER_JSON_URL=!USER_JSON_LINE:* =!
+        echo Update !USER_JSON_FILE! with !USER_JSON_URL!
+        cscript /nologo ~gdownload.vbs "!USER_JSON_URL!" "!USER_JSON_FILE!"
+    )
+)
 
-set localname=
+set filename_prefix=goproxy_windows_386
+if "%PROCESSOR_ARCHITECTURE%" == "AMD64" (
+    set filename_prefix=goproxy_windows_amd64
+)
+if exist "%SystemDrive%\Program Files (x86)" (
+    set filename_prefix=goproxy_windows_amd64
+)
+
 if exist "goproxy.exe" (
     for /f "usebackq" %%I in (`goproxy.exe -version`) do (
-        echo %%I | findstr /r "r[0-9][0-9][0-9][0-9]*" >NUL && (
-            set localname=!filename_pattern!-%%I.7z
+        echo %%I | findstr /r "r[0-9][0-9][0-9][0-9][0-9]*" >NUL && (
+            set localversion=%%I
         )
     )
 )
-if not "%localname%" == "" (
-    echo 0. Local Goproxy version %localname%
+if not "%localversion%" == "" (
+    echo 0. Local Goproxy version %localversion%
 )
 
-set filename=
+set remoteversion=
 (
     title 1. Checking GoProxy Version
     echo 1. Checking GoProxy Version
-    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy/releases/tag/goproxy ~goproxy_tag.txt
+    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy/releases/latest ~goproxy_tag.txt
 ) && (
-    for /f "usebackq tokens=3 delims=<>" %%I in (`findstr "<strong>%filename_pattern%-r" ~goproxy_tag.txt`) do (
-        set filename=%%I
+    for /f "usebackq tokens=4 delims=<>-." %%I in (`findstr "<strong>%filename_prefix%-r" ~goproxy_tag.txt`) do (
+        set remoteversion=%%I
     )
+) || (
+    echo Cannot detect !filename_prefix! version
+    goto quit
 )
 del /f ~goproxy_tag.txt
-if "%filename%" == "" (
-    echo Cannot detect %filename_pattern% version
+if "!remoteversion!" == "" (
+    echo Cannot detect !filename_prefix! version
     goto quit
 )
 
-if "%localname%" == "%filename%" (
-    echo.
-    echo Your Goproxy already update to latest.
-    goto quit
+if "!localversion!" neq "r9999" (
+    if "!localversion!" geq "!remoteversion!" (
+        echo.
+        echo Your Goproxy already update to latest.
+        goto quit
+    )
 )
+
+set filename=!filename_prefix!-!remoteversion!.7z
 
 (
-    title 2. Downloading 7za.exe for extracting
-    echo 2. Downloading 7za.exe for extracting
-    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy/raw/master/assets/download/7za.exe ~7za.exe
-    if not exist "~7za.exe" (
-        echo Cannot download 7za.exe
+    title 2. Downloading 7zCon.sfx for extracting
+    echo 2. Downloading 7zCon.sfx for extracting
+    cscript /nologo ~gdownload.vbs https://raw.githubusercontent.com/phuslu/goproxy/master/assets/download/7zCon.sfx ~7zCon.sfx
+    if not exist "~7zCon.sfx" (
+        echo Cannot download 7zCon.sfx
         goto quit
     )
 ) && (
     title 3. Downloading %filename%
     echo 3. Downloading %filename%
-    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy/releases/download/goproxy/%filename% "~%filename%"
+    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy-ci/releases/download/!remoteversion!/%filename% "~%filename%"
     if not exist "~%filename%" (
         echo Cannot download %filename%
         goto quit
     )
 ) && (
-    title 4. Checking Goproxy program
-    echo 4. Checking Goproxy program
-:checkgoproxyprogram
-    wmic process where "name='goproxy.exe'" get ExecutablePath | findstr /l "%~dp0goproxy.exe" >NUL && (
-        echo %TIME% Please quit GoProxy program and continue
-        ping -n 2 127.0.0.1 >NUL
-        goto checkgoproxyprogram
+    title 4. Extract Goproxy files
+    echo 4. Extract Goproxy files
+    copy /b ~7zCon.sfx+~%filename% ~%filename%.exe
+    del /f ~gdownload.vbs ~7zCon.sfx ~%filename% 2>NUL
+    for %%I in ("goproxy.exe" "goproxy-gui.exe") do (
+        if exist "%%~I" (
+            move /y "%%~I" "~%%~nI.%localversion%.%%~xI.tmp"
+        )
     )
-    title 5. Extract Goproxy files
-    echo 5. Extract Goproxy files
-    ~7za.exe x -y ~%filename%
-    title 6. Update %filename% OK
-    echo 6. Update %filename% OK
+    ~%filename%.exe -y
+    title 5. Update %filename% OK
+    echo 5. Update %filename% OK
 )
 
 :quit
-    del /f ~* 2>NUL
+    del /f ~* 1>NUL 2>NUL
     pause >NUL

@@ -40,9 +40,9 @@ type Filter struct {
 func init() {
 	filename := filterName + ".json"
 	config := new(Config)
-	err := storage.ReadJsonConfig(storage.LookupConfigStoreURI(filterName), filename, config)
+	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
 	if err != nil {
-		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
+		glog.Fatalf("UnmarshallJson(%#v) failed: %s", filename, err)
 	}
 
 	err = filters.Register(filterName, &filters.RegisteredFilter{
@@ -124,11 +124,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 	glog.V(1).Infof("UnAuthenticated URL %v from %#v", req.URL.String(), req.RemoteAddr)
 
 	noAuthResponse := &http.Response{
-		Status:        "407 Proxy Authentication Required",
 		StatusCode:    http.StatusProxyAuthRequired,
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
 		Header:        http.Header{},
 		Request:       req,
 		Close:         true,

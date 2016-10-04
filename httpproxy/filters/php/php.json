@@ -1,24 +1,23 @@
 {
 	"Servers": [
 		{
-			"Url": "http://yourapp.com/",
+			"URL": "https://example.com/",
 			"Password": "123456",
 			"SSLVerify": false,
 			"Host": "",
 		}
-	],
-	"Sites": [
-		"*"
 	],
 	"Transport": {
 		"Dialer": {
 			"Timeout": 10,
 			"KeepAlive": 180,
 			"DualStack": false,
-			"RetryTimes": 2,
-			"RetryDelay": 0.05,
 			"DNSCacheExpiry": 3600,
-			"DNSCacheSize": 81920
+			"DNSCacheSize": 8192
+		},
+		"Proxy": {
+			"Enabled": false,
+			"URL": "http://127.0.0.1:8087",
 		},
 		"DisableKeepAlives": false,
 		"DisableCompression": false,

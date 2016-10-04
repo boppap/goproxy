@@ -1,21 +1,24 @@
 #!/bin/sh
 #
-# goproxy init script
+#       /etc/rc.d/init.d/goproxy
 #
+#       a go proxy
+#
+# chkconfig:   2345 95 05
+# description: a go proxy
 
 ### BEGIN INIT INFO
-# Provides:          goproxy
-# Required-Start:    $syslog
-# Required-Stop:     $syslog
-# Should-Start:      $local_fs
-# Should-Stop:       $local_fs
-# Default-Start:     2 3 4 5
-# Default-Stop:      0 1 6
-# Short-Description: Monitor for goproxy activity
-# Description:       goproxy is a go proxy
+# Provides:       goproxy
+# Required-Start: $network
+# Required-Stop:
+# Should-Start:
+# Should-Stop:
+# Default-Start: 2 3 4 5
+# Default-Stop:  0 1 6
+# Short-Description: start and stop goproxy
+# Description: a go proxy
 ### END INIT INFO
 
-# **NOTE** bash will exit immediately if any command exits with non-zero.
 set -e
 
 PACKAGE_NAME=goproxy
@@ -24,7 +27,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:${PATH}
 
 start() {
     echo -n "Starting ${PACKAGE_DESC}: "
-    nohup ./goproxy -v=2 -logtostderr=0 -log_dir=/var/log/ &
+    mkdir -p /var/log/goproxy
+    nohup ./goproxy -v=2 -logtostderr=0 -log_dir=/var/log/goproxy &
     echo "${PACKAGE_NAME}."
 }
 
@@ -46,11 +50,6 @@ usage() {
     exit 1
 }
 
-if [ "$(id -u)" != "0" ]; then
-    echo "please use sudo to run ${PACKAGE_NAME}"
-    exit 0
-fi
-
 # `readlink -f` won't work on Mac, this hack should work on all systems.
 cd $(python -c "import os; print(os.path.dirname(os.path.realpath('$0')))")
 
@@ -69,4 +68,4 @@ case "$1" in
         ;;
 esac
 
-exit 0
+exit $?

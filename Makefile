@@ -1,8 +1,8 @@
-DEBUG ?= 0
-REVSION = $(shell git rev-list HEAD | wc -l | xargs)
+REVSION = $(shell git rev-list --count HEAD)
+HTTP2REV = $(shell (cd $$GOPATH/src/github.com/phuslu/net/http2; git log --oneline -1 --format="%h"))
 
-PACKAGE = goproxy
 REPO = $(shell git rev-parse --show-toplevel)
+PACKAGE = $(shell basename $(REPO))
 BUILDROOT = $(REPO)/build
 STAGEDIR = $(BUILDROOT)/stage
 OBJECTDIR = $(BUILDROOT)/obj
@@ -23,10 +23,12 @@ else ifeq ($(GOOS), darwin)
 	GOPROXY_DISTEXT = .tar.bz2
 else
 	GOPROXY_EXE = $(PACKAGE)
-	GOPROXY_STAGEDIR = $(STAGEDIR)/goproxy
+	GOPROXY_STAGEDIR = $(STAGEDIR)/$(PACKAGE)
 	GOPROXY_DISTCMD = XZ_OPT=-9 tar cvJpf
 	GOPROXY_DISTEXT = .tar.xz
 endif
+
+GOPROXY_DIST = $(DISTDIR)/$(PACKAGE)_$(GOOS)_$(GOARCH)-r$(REVSION)$(GOPROXY_DISTEXT)
 
 OBJECTS :=
 OBJECTS += $(OBJECTDIR)/$(GOPROXY_EXE)
@@ -36,6 +38,9 @@ SOURCES += $(REPO)/README.md
 SOURCES += $(REPO)/httpproxy/httpproxy.json
 SOURCES += $(wildcard $(REPO)/httpproxy/filters/*/*.json)
 SOURCES += $(REPO)/httpproxy/filters/autoproxy/gfwlist.txt
+SOURCES += $(REPO)/httpproxy/filters/autoproxy/17monipdb.dat
+SOURCES += $(REPO)/httpproxy/filters/autoproxy/ip.html
+SOURCES += $(REPO)/assets/packaging/gae.user.json.example
 
 ifeq ($(GOOS)_$(GOARCH), windows_amd64)
 	SOURCES += $(REPO)/assets/packaging/goproxy-gui.exe
@@ -47,29 +52,31 @@ else ifeq ($(GOOS)_$(GOARCH), windows_386)
 	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.cmd
 else ifeq ($(GOOS), darwin)
 	SOURCES += $(REPO)/assets/packaging/goproxy-macos.command
+	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
 else
 	SOURCES += $(REPO)/assets/packaging/goproxy-gtk.py
+	SOURCES += $(REPO)/assets/packaging/goproxy-gtk.png
+	SOURCES += $(REPO)/assets/packaging/goproxy-gtk.desktop
 	SOURCES += $(REPO)/assets/packaging/goproxy.sh
-endif
-
-LDFLAGS = -X main.version=r$(REVSION)
-ifeq ($(DEBUG), 0)
-	LDFLAGS += -s -w
+	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
 endif
 
 .PHONY: build
-build: $(DISTDIR)/$(PACKAGE)_$(GOOS)_$(GOARCH)-r$(REVSION)$(GOPROXY_DISTEXT)
-	ls -lht $(DISTDIR)
+build: $(GOPROXY_DIST)
+	@ls -lht $(DISTDIR)
 
 .PHONY: clean
 clean:
 	$(RM) -rf $(BUILDROOT)
 
-$(DISTDIR)/$(PACKAGE)_$(GOOS)_$(GOARCH)-r$(REVSION)$(GOPROXY_DISTEXT): $(OBJECTS)
+$(GOPROXY_DIST): $(OBJECTS)
 	mkdir -p $(DISTDIR) $(STAGEDIR) $(GOPROXY_STAGEDIR)
 	cp $(OBJECTS) $(SOURCES) $(GOPROXY_STAGEDIR)
+ifeq ($(GOOS)_$(GOARCH), $(shell go env GOOS)_$(shell go env GOARCH))
+	GOPROXY_WAIT_SECONDS=0 $(GOPROXY_STAGEDIR)/$(GOPROXY_EXE)
+endif
 	cd $(STAGEDIR) && $(GOPROXY_DISTCMD) $@ *
 
 $(OBJECTDIR)/$(GOPROXY_EXE):
 	mkdir -p $(OBJECTDIR)
-	go build -v -ldflags="$(LDFLAGS)" -o $@ .
+	go build -v -ldflags="-s -w -X main.version=r$(REVSION) -X main.http2rev=$(HTTP2REV)" -o $@ .
