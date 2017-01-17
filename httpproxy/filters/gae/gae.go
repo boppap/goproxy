@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"flag"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -185,7 +186,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		googleTLSConfig.ServerName = config.TLSConfig.ServerName[rand.Intn(len(config.TLSConfig.ServerName))]
 	}
 	if !config.DisableHTTP2 {
-		googleTLSConfig.NextProtos = []string{"h2", "h2-14", "http/1.1"}
+		googleTLSConfig.NextProtos = []string{"h2", "http/1.1"}
 	}
 
 	if config.Site2Alias == nil {
@@ -235,7 +236,8 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		TLSConnDuration:   lrucache.NewLRUCache(8192),
 		TLSConnError:      lrucache.NewLRUCache(8192),
 		TLSConnReadBuffer: config.Transport.Dialer.SocketReadBuffer,
-		ConnExpiry:        5 * time.Minute,
+		GoodConnExpiry:    5 * time.Minute,
+		ErrorConnExpiry:   30 * time.Minute,
 		Level:             config.Transport.Dialer.Level,
 	}
 
@@ -245,6 +247,15 @@ func NewFilter(config *Config) (filters.Filter, error) {
 
 	var tr http.RoundTripper
 
+	GetConnectMethodAddr := func(addr string) string {
+		if host, port, err := net.SplitHostPort(addr); err == nil {
+			if alias, ok := md.SiteToAlias.Lookup(host); ok {
+				addr = net.JoinHostPort(alias.(string), port)
+			}
+		}
+		return addr
+	}
+
 	t1 := &http.Transport{
 		Dial:                  md.Dial,
 		DialTLS:               md.DialTLS,
@@ -253,6 +264,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		ResponseHeaderTimeout: time.Duration(config.Transport.ResponseHeaderTimeout) * time.Second,
 		IdleConnTimeout:       time.Duration(config.Transport.IdleConnTimeout) * time.Second,
 		MaxIdleConnsPerHost:   config.Transport.MaxIdleConnsPerHost,
+		GetConnectMethodAddr:  GetConnectMethodAddr,
 	}
 
 	if config.Transport.Proxy.Enabled {
@@ -318,14 +330,24 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	if config.EnableDeadProbe && !config.Transport.Proxy.Enabled {
 		go func() {
 			probe := func() {
+				c, err := net.DialTimeout("tcp", net.JoinHostPort(config.DNSServers[0], "53"), 300*time.Millisecond)
+				if err != nil {
+					glog.V(3).Infof("GAE EnableDeadProbe connect DNSServer(%#v) failed: %+v", config.DNSServers[0], err)
+					return
+				}
+				c.Close()
+
 				req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
-				ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
+				ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
 				defer cancel()
 				req = req.WithContext(ctx)
 				resp, err := tr.RoundTrip(req)
-				if resp != nil && resp.Body != nil {
+				if resp != nil {
 					glog.V(3).Infof("GAE EnableDeadProbe \"%s %s\" %d -", req.Method, req.URL.String(), resp.StatusCode)
-					defer resp.Body.Close()
+					if resp.Body != nil {
+						io.Copy(ioutil.Discard, resp.Body)
+						resp.Body.Close()
+					}
 					if resp.StatusCode == http.StatusBadGateway {
 						if ip, err := helpers.ReflectRemoteIPFromResponse(resp); err == nil && ip != nil {
 							duration := 1 * time.Hour
@@ -344,7 +366,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 			}
 
 			for {
-				time.Sleep(time.Duration(5+rand.Intn(6)) * time.Second)
+				time.Sleep(time.Duration(2+rand.Intn(5)) * time.Second)
 				probe()
 			}
 		}()
@@ -385,7 +407,7 @@ func (f *Filter) FilterName() string {
 func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
 	var tr http.RoundTripper = f.GAETransport
 
-	if req.URL.Scheme == "http" && f.ForceHTTPSMatcher.Match(req.Host) {
+	if req.URL.Scheme == "http" && f.ForceHTTPSMatcher.Match(req.Host) && req.URL.Path != "/ocsp" {
 		if !strings.HasPrefix(req.Header.Get("Referer"), "https://") {
 			u := strings.Replace(req.URL.String(), "http://", "https://", 1)
 			glog.V(2).Infof("GAE FORCEHTTPS get raw url=%v, redirect to %v", req.URL.String(), u)
@@ -505,6 +527,18 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 				Timeout() bool
 			}); ok && ne.Timeout() {
 				// f.MultiDialer.ClearCache()
+				helpers.CloseConnections(tr)
+			}
+			if ne, ok := err.(*net.OpError); ok {
+				if ip, _, err := net.SplitHostPort(ne.Addr.String()); err == nil {
+					if f.GAETransport.MultiDialer != nil {
+						duration := 5 * time.Minute
+						glog.Warningf("GAE: %s \"DIRECT\" timeout, add to blacklist for %v", ip, duration)
+						f.GAETransport.MultiDialer.IPBlackList.Set(ip, struct{}{}, time.Now().Add(duration))
+					}
+				}
+			}
+			if err.Error() == "unexpected EOF" {
 				helpers.CloseConnections(tr)
 			}
 		}

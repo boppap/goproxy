@@ -26,7 +26,6 @@ func main() {
 		return
 	}
 
-	helpers.FixOSArgs0()
 	helpers.SetFlagsIfAbsent(map[string]string{
 		"logtostderr": "true",
 		"v":           "2",
@@ -52,7 +51,9 @@ GoProxy Version    : %s (go/%s http2/%s %s/%s)`,
 		if ip, port, err := net.SplitHostPort(addr); err == nil {
 			switch ip {
 			case "", "0.0.0.0", "::":
-				if ips, err := helpers.LocalIPv4s(); err == nil && len(ips) > 0 {
+				if ip1, err := helpers.LocalPerferIPv4(); err == nil {
+					ip = ip1.String()
+				} else if ips, err := helpers.LocalIPv4s(); err == nil && len(ips) > 0 {
 					ip = ips[0].String()
 				}
 			}

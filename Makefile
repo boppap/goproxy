@@ -1,15 +1,20 @@
 REVSION = $(shell git rev-list --count HEAD)
 HTTP2REV = $(shell (cd $$GOPATH/src/github.com/phuslu/net/http2; git log --oneline -1 --format="%h"))
 
+GOOS ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+CGO_ENABLED ?= 0
+
 REPO = $(shell git rev-parse --show-toplevel)
 PACKAGE = $(shell basename $(REPO))
-BUILDROOT = $(REPO)/build
+ifeq ($(CGO_ENABLED), 0)
+	BUILDROOT = $(REPO)/build/$(GOOS)_$(GOARCH)
+else
+	BUILDROOT = $(REPO)/build/$(GOOS)_$(GOARCH)_cgo
+endif
 STAGEDIR = $(BUILDROOT)/stage
 OBJECTDIR = $(BUILDROOT)/obj
 DISTDIR = $(BUILDROOT)/dist
-
-GOOS ?= $(shell go env GOOS)
-GOARCH ?= $(shell go env GOARCH)
 
 ifeq ($(GOOS), windows)
 	GOPROXY_EXE = $(PACKAGE).exe
@@ -29,6 +34,9 @@ else
 endif
 
 GOPROXY_DIST = $(DISTDIR)/$(PACKAGE)_$(GOOS)_$(GOARCH)-r$(REVSION)$(GOPROXY_DISTEXT)
+ifeq ($(CGO_ENABLED), 1)
+	GOPROXY_DIST = $(DISTDIR)/$(PACKAGE)_$(GOOS)_$(GOARCH)_cgo-r$(REVSION)$(GOPROXY_DISTEXT)
+endif
 
 OBJECTS :=
 OBJECTS += $(OBJECTDIR)/$(GOPROXY_EXE)
@@ -50,6 +58,17 @@ else ifeq ($(GOOS)_$(GOARCH), windows_386)
 	SOURCES += $(REPO)/assets/packaging/goproxy-gui.exe
 	SOURCES += $(REPO)/assets/packaging/addto-startup.vbs
 	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.cmd
+else ifeq ($(GOOS)_$(GOARCH)_$(CGO_ENABLED), linux_arm_0)
+	GOARM ?= 5
+	SOURCES += $(REPO)/assets/packaging/goproxy.sh
+	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
+	SOURCES += $(REPO)/assets/packaging/logrotate.conf
+else ifeq ($(GOOS)_$(GOARCH)_$(CGO_ENABLED), linux_arm_1)
+	GOARM ?= 5
+	CC = $(or $(ARM_CC), arm-linux-gnueabihf-gcc)
+	SOURCES += $(REPO)/assets/packaging/goproxy.sh
+	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
+	SOURCES += $(REPO)/assets/packaging/logrotate.conf
 else ifeq ($(GOOS), darwin)
 	SOURCES += $(REPO)/assets/packaging/goproxy-macos.command
 	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
@@ -59,6 +78,7 @@ else
 	SOURCES += $(REPO)/assets/packaging/goproxy-gtk.desktop
 	SOURCES += $(REPO)/assets/packaging/goproxy.sh
 	SOURCES += $(REPO)/assets/packaging/get-latest-goproxy.sh
+	SOURCES += $(REPO)/assets/packaging/logrotate.conf
 endif
 
 .PHONY: build
@@ -79,4 +99,5 @@ endif
 
 $(OBJECTDIR)/$(GOPROXY_EXE):
 	mkdir -p $(OBJECTDIR)
+	env GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) CC=$(CC) \
 	go build -v -ldflags="-s -w -X main.version=r$(REVSION) -X main.http2rev=$(HTTP2REV)" -o $@ .

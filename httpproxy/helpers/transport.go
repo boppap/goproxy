@@ -3,6 +3,7 @@ package helpers
 import (
 	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/phuslu/net/http2"
 )
@@ -23,6 +24,13 @@ var (
 
 func CloseConnections(tr http.RoundTripper) bool {
 	if t, ok := tr.(*http.Transport); ok {
+		f := func(conn net.Conn, idle bool) bool {
+			return true
+		}
+		t.CloseConnections(f)
+		return true
+	}
+	if t, ok := tr.(*http2.Transport); ok {
 		f := func(conn net.Conn, idle bool) bool {
 			return true
 		}
@@ -54,6 +62,14 @@ func FixRequestURL(req *http.Request) {
 			req.URL.Host = req.Host
 		case req.TLS != nil:
 			req.URL.Host = req.TLS.ServerName
+		}
+	}
+}
+
+func FixRequestHeader(req *http.Request) {
+	if req.ContentLength > 0 {
+		if req.Header.Get("Content-Length") == "" {
+			req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
 		}
 	}
 }

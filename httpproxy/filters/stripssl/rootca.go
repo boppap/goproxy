@@ -45,7 +45,11 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 
 	var store storage.Store
 	if portable {
-		store = &storage.FileStore{filepath.Dir(os.Args[0])}
+		exe, err := os.Executable()
+		if err != nil {
+			glog.Fatalf("os.Executable() error: %+v", err)
+		}
+		store = &storage.FileStore{filepath.Dir(exe)}
 	} else {
 		store = &storage.FileStore{"."}
 	}
@@ -78,6 +82,8 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 					},
 				},
 			},
+			DNSNames: []string{name},
+
 			NotBefore: time.Now().Add(-time.Duration(30 * 24 * time.Hour)),
 			NotAfter:  time.Now().Add(vaildFor),
 
@@ -201,6 +207,7 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 			OrganizationalUnit: []string{c.name},
 			CommonName:         commonName,
 		},
+		DNSNames:           []string{commonName},
 		SignatureAlgorithm: x509.SHA256WithRSA,
 	}
 
@@ -221,6 +228,7 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 
 	certTemplate := &x509.Certificate{
 		Subject:            csr.Subject,
+		DNSNames:           []string{commonName},
 		PublicKeyAlgorithm: csr.PublicKeyAlgorithm,
 		PublicKey:          csr.PublicKey,
 		SerialNumber:       big.NewInt(time.Now().UnixNano()),

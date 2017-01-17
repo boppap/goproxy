@@ -24,34 +24,44 @@ set -e
 PACKAGE_NAME=goproxy
 PACKAGE_DESC="a go proxy"
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:${PATH}
+SUDO=$(test $(id -u) = 0 || echo sudo)
 
 start() {
     echo -n "Starting ${PACKAGE_DESC}: "
-    mkdir -p /var/log/goproxy
-    nohup ./goproxy -v=2 -logtostderr=0 -log_dir=/var/log/goproxy &
+    local log_dir=$(test -d "/var/log" && echo "/var/log/${PACKAGE_NAME}" || echo "$(pwd)/logs")
+    mkdir -p ${log_dir}
+    if busybox start-stop-daemon --help 2>/dev/null ; then
+        busybox start-stop-daemon -S -b -x ./goproxy -- -v=2 -logtostderr=0 -log_dir=/var/log/goproxy
+    else
+        nohup ./goproxy -v=2 -logtostderr=0 -log_dir=${log_dir} >/dev/null 2>&1 &
+    fi
     echo "${PACKAGE_NAME}."
+    if [ -d '/etc/logrotate.d/' ]; then
+        if [ ! -f '/etc/logrotate.d/goproxy' ]; then
+            echo "Dont Forget: $(SUDO) cp $(pwd)/logrotate.conf /etc/logrotate.d/goproxy"
+        fi
+    fi
 }
 
 stop() {
     echo -n "Stopping ${PACKAGE_DESC}: "
-    killall goproxy >/dev/null 2>&1 || true
+    killall goproxy
     echo "${PACKAGE_NAME}."
 }
 
 restart() {
-    stop || true
+    stop
     sleep 1
     start
 }
 
 usage() {
-    N=$(basename "$0")
-    echo "Usage: [sudo] $N {start|stop|restart}" >&2
+    echo "Usage: [sudo] $(basename "$0") {start|stop|restart}" >&2
     exit 1
 }
 
-# `readlink -f` won't work on Mac, this hack should work on all systems.
-cd $(python -c "import os; print(os.path.dirname(os.path.realpath('$0')))")
+linkpath=$(ls -l "$0" | sed "s/.*->\s*//")
+cd "$(dirname "$0")" && test -f "$linkpath" && cd "$(dirname "$linkpath")" || true
 
 case "$1" in
     start)

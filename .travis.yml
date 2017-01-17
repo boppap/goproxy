@@ -1,3 +1,4 @@
+dist: trusty
 sudo: false
 
 language: bash
@@ -17,6 +18,11 @@ branches:
 addons:
   apt:
     packages:
+      - g++-mingw-w64
+      - gcc-4.8-multilib-arm-linux-gnueabihf
+      - gcc-arm-linux-gnueabihf
+      - lftp
+      - libc6-dev-armhf-cross
       - p7zip-full
 
 notifications:

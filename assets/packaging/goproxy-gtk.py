@@ -10,7 +10,7 @@ import platform
 
 if platform.mac_ver()[0] > '10.':
     sys.exit(os.system(
-        'osascript -e \'display dialog "Please click goproxy-macos.command" buttons {"OK"} default button 1 with icon caution with title "GoProxy GTK"\''))
+        'osascript -e \'display dialog "Please use goproxy-macos rather than goproxy-gtk" buttons {"OK"} default button 1 with icon caution with title "GoProxy GTK"\''))
 
 try:
     import pygtk
@@ -52,10 +52,10 @@ def spawn_later(seconds, target, *args, **kwargs):
 def rewrite_desktop(filename):
     with open(filename, 'rb') as fp:
         content = fp.read()
-    if 'goproxy-gtk.png' not in content:
+    with open(filename, 'wb') as fp:
+        content = re.sub(r'(?m)Exec=.*', '''Exec=bash -c "export PATH=$PATH:`dirname '%%k'`:%s; exec goproxy-gtk.py"''' % os.getcwd(), content)
         content = re.sub(r'Icon=\S*', 'Icon=%s/goproxy-gtk.png' % os.getcwd(), content)
-        with open(filename, 'wb') as fp:
-            fp.write(content)
+        fp.write(content)
 
 #gtk.main_quit = lambda: None
 #appindicator = None
@@ -70,7 +70,7 @@ class GoProxyGTK:
 
     def __init__(self, window, terminal):
         self.window = window
-        self.window.set_size_request(652, 447)
+        self.window.set_size_request(640, 480)
         self.window.set_position(gtk.WIN_POS_CENTER)
         self.window.connect('delete-event', self.delete_event)
         self.terminal = terminal
