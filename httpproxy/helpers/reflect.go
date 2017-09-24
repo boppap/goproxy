@@ -27,14 +27,6 @@ func ReflectRemoteIPFromResponse(resp *http.Response) (net.IP, error) {
 }
 
 func ReflectRemoteAddrFromResponse(resp *http.Response) (string, error) {
-	// if v := reflect.ValueOf(resp).Elem().FieldByName("RemoteAddr"); v.IsValid() {
-	// 	return v.String(), nil
-	// }
-	return reflectRemoteAddrFromResponse(resp)
-}
-
-func reflectRemoteAddrFromResponse(resp *http.Response) (string, error) {
-
 	if resp.Body == nil {
 		return "", fmt.Errorf("ReflectRemoteAddrFromResponse: cannot reflect %#v for %v", resp, resp.Request.URL.String())
 	}
@@ -60,10 +52,12 @@ func reflectRemoteAddrFromResponse(resp *http.Response) (string, error) {
 		default:
 			return "", fmt.Errorf("ReflectRemoteAddrFromResponse: unsupport %#v Type=%s", v, v.Type().String())
 		}
-	case "http2.transportResponseBody":
+	case "http.http2transportResponseBody", "http2.transportResponseBody":
 		v = v.FieldByName("cs").Elem()
 		v = v.FieldByName("cc").Elem()
 		v = v.FieldByName("tconn").Elem()
+	case "*quic.stream":
+		return resp.Body.(net.Conn).RemoteAddr().String(), nil
 	default:
 		return "", fmt.Errorf("ReflectRemoteAddrFromResponse: unsupport %#v Type=%s", v, v.Type().String())
 	}

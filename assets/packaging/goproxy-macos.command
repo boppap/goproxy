@@ -2,7 +2,7 @@
 #!/usr/bin/python2.7
 # coding:utf-8
 
-__version__ = '2.1'
+__version__ = 'r9999'
 
 GOPROXY_TITLE = "GoProxy macOS"
 GOPROXY_ICON_DATA = """\
@@ -36,6 +36,7 @@ import os
 import re
 import glob
 import base64
+import plistlib
 import ctypes
 import ctypes.util
 
@@ -102,17 +103,16 @@ class GoProxyHelpers(object):
     @property
     def network_location(self):
         if self.__network_location == '':
-            s = os.popen('system_profiler SPNetworkDataType').read()
-            addrs = re.findall(r'(?is)\s*([^\n]+):\s+Type:\s+(AirPort|Ethernet).+?Addresses:\s*(\S+).+?(?:\n\n|$)', s)
-            self.__network_location = next(n for n,t,a in addrs if re.match('^[0-9a-fA-F\.:]+$', a))
+            ps = plistlib.readPlistFromString(os.popen('system_profiler SPNetworkDataType -xml').read())
+            self.__network_location = next(x['_name'] for x in ps[0]['_items'] if x['IPv4'].get('Addresses'))
         return self.__network_location
 
     def get_current_proxy(self):
         s = os.popen('scutil --proxy').read()
         info = dict(re.findall('(?m)^\s+([A-Z]\w+)\s+:\s+(\S+)', s))
-        if info['HTTPEnable'] == '1':
+        if info.get('HTTPEnable') == '1':
             return '%s:%s' % (info['HTTPProxy'], info['HTTPPort'])
-        elif info['ProxyAutoConfigEnable'] == '1':
+        elif info.get('ProxyAutoConfigEnable') == '1':
             return info['ProxyAutoConfigURLString']
         else:
             return '<None>'
@@ -250,7 +250,7 @@ class GoProxyMacOS(NSObject):
         self.console_window.contentView().addSubview_(self.scroll_view)
 
         # Update Proxy Menu
-        self.updateproxystate_(None)
+        AppHelper.callLater(1, self.updateproxystate_, None)
         # Hide dock icon
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 
@@ -283,14 +283,14 @@ class GoProxyMacOS(NSObject):
     def stopGoProxy(self):
         self.pipe.terminate()
 
-    def parseLine(self, line):
+    def parseLine_(self, line):
         if line.startswith('\x1b]2;') and '\x07' in line:
             global GOPROXY_TITLE
             pos = line.find('\x07')
             GOPROXY_TITLE = line[4:pos]
             self.statusitem.setToolTip_(GOPROXY_TITLE)
             self.console_window.setTitle_(GOPROXY_TITLE)
-            return self.parseLine(line[pos:])
+            return self.parseLine_(line[pos:])
         while line.startswith('\x1b['):
             line = line[2:]
             color_number = int(line.split('m',1)[0])
@@ -302,7 +302,7 @@ class GoProxyMacOS(NSObject):
         return line
 
     def refreshDisplay_(self, line):
-        line = self.parseLine(line)
+        line = self.parseLine_(line)
         console_line = NSMutableAttributedString.alloc().initWithString_(line)
         console_line.addAttribute_value_range_(NSForegroundColorAttributeName, self.console_color, NSMakeRange(0,len(line)))
         self.console_view.textStorage().appendAttributedString_(console_line)
@@ -365,17 +365,40 @@ class GoProxyMacOS(NSObject):
         NSApp.terminate_(self)
 
 
+def get_executables():
+    MAXPATHLEN = 1024
+    PROC_PIDPATHINFO_MAXSIZE = MAXPATHLEN * 4
+    PROC_ALL_PIDS = 1
+    libc = ctypes.CDLL(ctypes.util.find_library('c'))
+    number_of_pids = libc.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+    pid_list = (ctypes.c_uint32 * (number_of_pids * 2))()
+    libc.proc_listpids(PROC_ALL_PIDS, 0, pid_list, ctypes.sizeof(pid_list))
+    results = []
+    path_size = PROC_PIDPATHINFO_MAXSIZE
+    path_buffer = ctypes.create_string_buffer('\0'*path_size,path_size)
+    for pid in pid_list:
+        # re-use the buffer
+        ctypes.memset(path_buffer, 0, path_size)
+        return_code = libc.proc_pidpath(pid, path_buffer, path_size)
+        if path_buffer.value:
+            results.append((pid, path_buffer.value))
+    return results
+
+
 def precheck():
     has_user_json = glob.glob('*.user.json') != []
     if not has_user_json:
         alert = NSAlert.alloc().init()
-        alert.setMessageText_('Please configure your goproxy at first.')
-        alert.setInformativeText_('e.g. add a new gae.user.json')
+        alert.setMessageText_('GoProxy Information:')
+        alert.setInformativeText_('Please configure your goproxy at first.\nFor example, add a new gae.user.json')
         alert.setAlertStyle_(NSWarningAlertStyle)
         alert.addButtonWithTitle_('OK')
         NSApp.activateIgnoringOtherApps_(True)
         pressed = alert.runModal()
         os.system('open "%s"' % os.path.dirname(__file__))
+    for pid, path in get_executables():
+        if path.endswith('/goproxy'):
+            os.kill(pid, 9)
 
 
 def main():

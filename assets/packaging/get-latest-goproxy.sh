@@ -22,10 +22,6 @@ if [ -f "httpproxy.json" ]; then
 	fi
 fi
 
-if [ -d cache ]; then
-	find cache -name "*.crt" -mtime +90 -delete
-fi
-
 FILENAME_PREFIX=
 case $(uname -s)/$(uname -m) in
 	Linux/x86_64 )
@@ -54,6 +50,9 @@ case $(uname -s)/$(uname -m) in
 		;;
 	Linux/mips )
 		FILENAME_PREFIX=goproxy_linux_mips
+		if hexdump -s 5 -n 1 $SHELL | grep -q 0001; then
+			FILENAME_PREFIX=goproxy_linux_mipsle
+		fi
 		;;
 	FreeBSD/x86_64 )
 		FILENAME_PREFIX=goproxy_freebsd_amd64
@@ -73,6 +72,15 @@ case $(uname -s)/$(uname -m) in
 		;;
 esac
 
+if ./goproxy -version >/dev/null 2>&1; then
+	GOPROXY_OS=$(./goproxy -os)
+	GOPROXY_ARCH=$(./goproxy -arch)
+	if test "${GOPROXY_OS}" = "darwin"; then
+		GOPROXY_OS=macos
+	fi
+	FILENAME_PREFIX=goproxy_${GOPROXY_OS}_${GOPROXY_ARCH}
+fi
+
 LOCALVERSION=$(./goproxy -version 2>/dev/null || :)
 echo "0. Local Goproxy version ${LOCALVERSION}"
 
@@ -89,7 +97,7 @@ for USER_JSON_FILE in *.user.json; do
 	if echo "${USER_JSON_LINE}" | grep -q AUTO_UPDATE_URL; then
 		USER_JSON_URL=${USER_JSON_LINE#* }
 		echo "Update ${USER_JSON_FILE} with ${USER_JSON_URL}"
-		curl -k "${USER_JSON_URL}" >${USER_JSON_FILE}.tmp
+		curl -fk "${USER_JSON_URL}" >${USER_JSON_FILE}.tmp
 		mv ${USER_JSON_FILE}.tmp ${USER_JSON_FILE}
 	fi
 done

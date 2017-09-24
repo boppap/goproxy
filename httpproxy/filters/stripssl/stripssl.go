@@ -24,12 +24,12 @@ const (
 )
 
 type Config struct {
-	RootCA struct {
+	TLSVersion string
+	RootCA     struct {
 		Filename string
 		Dirname  string
 		Name     string
 		Duration int
-		RsaBits  int
 		Portable bool
 	}
 	Ports   []int
@@ -41,6 +41,7 @@ type Filter struct {
 	Config
 	CA             *RootCA
 	CAExpiry       time.Duration
+	TLSMaxVersion  uint16
 	TLSConfigCache lrucache.Cache
 	Ports          map[string]struct{}
 	Ignores        map[string]struct{}
@@ -48,22 +49,15 @@ type Filter struct {
 }
 
 func init() {
-	filename := filterName + ".json"
-	config := new(Config)
-	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
-	if err != nil {
-		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
-	}
-
-	err = filters.Register(filterName, &filters.RegisteredFilter{
-		New: func() (filters.Filter, error) {
-			return NewFilter(config)
-		},
+	filters.Register(filterName, func() (filters.Filter, error) {
+		filename := filterName + ".json"
+		config := new(Config)
+		err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
+		if err != nil {
+			glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
+		}
+		return NewFilter(config)
 	})
-
-	if err != nil {
-		glog.Fatalf("Register(%#v) error: %s", filterName, err)
-	}
 }
 
 var (
@@ -75,7 +69,6 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 	onceCA.Do(func() {
 		defaultCA, err = NewRootCA(config.RootCA.Name,
 			time.Duration(config.RootCA.Duration)*time.Second,
-			config.RootCA.RsaBits,
 			config.RootCA.Dirname,
 			config.RootCA.Portable)
 		if err != nil {
@@ -85,12 +78,17 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 
 	f := &Filter{
 		Config:         *config,
+		TLSMaxVersion:  tls.VersionTLS12,
 		CA:             defaultCA,
 		CAExpiry:       time.Duration(config.RootCA.Duration) * time.Second,
 		TLSConfigCache: lrucache.NewMultiLRUCache(4, 4096),
 		Ports:          make(map[string]struct{}),
 		Ignores:        make(map[string]struct{}),
 		Sites:          helpers.NewHostMatcher(config.Sites),
+	}
+
+	if v := helpers.TLSVersion(config.TLSVersion); v != 0 {
+		f.TLSMaxVersion = v
 	}
 
 	for _, port := range config.Ports {
@@ -154,10 +152,43 @@ func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Contex
 
 	var c net.Conn = conn
 	if needStripSSL {
-		config, err := f.issue(req.Host)
-		if err != nil {
-			conn.Close()
-			return ctx, nil, err
+		GetConfigForClient := func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			host := req.Host
+
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+
+			name := GetCommonName(host)
+			ecc := helpers.HasECCCiphers(hello.CipherSuites)
+
+			var cacheKey string
+			if ecc {
+				cacheKey = name
+			} else {
+				cacheKey = name + ",rsa"
+			}
+
+			var config interface{}
+			var ok bool
+			if config, ok = f.TLSConfigCache.Get(cacheKey); !ok {
+				cert, err := f.CA.Issue(name, f.CAExpiry, ecc)
+				if err != nil {
+					return nil, err
+				}
+				config = &tls.Config{
+					Certificates:             []tls.Certificate{*cert},
+					MaxVersion:               f.TLSMaxVersion,
+					MinVersion:               tls.VersionTLS10,
+					PreferServerCipherSuites: true,
+				}
+				f.TLSConfigCache.Set(cacheKey, config, time.Now().Add(7*24*time.Hour))
+			}
+			return config.(*tls.Config), nil
+		}
+
+		config := &tls.Config{
+			GetConfigForClient: GetConfigForClient,
 		}
 
 		tlsConn := tls.Server(conn, config)
@@ -185,43 +216,4 @@ func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Contex
 	go helpers.IOCopy(c, loConn)
 
 	return ctx, filters.DummyRequest, nil
-}
-
-func (f *Filter) issue(host string) (_ *tls.Config, err error) {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	name := GetCommonName(host)
-
-	var config interface{}
-	var ok bool
-	if config, ok = f.TLSConfigCache.Get(name); !ok {
-		cert, err := f.CA.Issue(name, f.CAExpiry, f.CA.RsaBits())
-		if err != nil {
-			return nil, err
-		}
-		config = &tls.Config{
-			Certificates: []tls.Certificate{*cert},
-			// TODO: follow up https://blog.gopheracademy.com/advent-2016/exposing-go-on-the-internet/
-			// MinVersion:               tls.VersionTLS12,
-			// PreferServerCipherSuites: true,
-			// CurvePreferences: []tls.CurveID{
-			// 	tls.CurveP256,
-			// 	tls.X25519,
-			// },
-			// CipherSuites: []uint16{
-			// 	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			// 	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			// 	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			// 	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			// 	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			// 	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			// 	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-			// 	tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			// },
-		}
-		f.TLSConfigCache.Set(name, config, time.Now().Add(f.CAExpiry))
-	}
-	return config.(*tls.Config), nil
 }

@@ -3,9 +3,13 @@ package helpers
 import (
 	"net"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
 
+	"github.com/phuslu/glog"
 	"github.com/phuslu/net/http2"
+	"github.com/phuslu/quic-go/h2quic"
 )
 
 var (
@@ -22,37 +26,43 @@ var (
 	}
 )
 
-func CloseConnections(tr http.RoundTripper) bool {
-	if t, ok := tr.(*http.Transport); ok {
-		f := func(conn net.Conn, idle bool) bool {
-			return true
-		}
-		t.CloseConnections(f)
-		return true
-	}
-	if t, ok := tr.(*http2.Transport); ok {
-		f := func(conn net.Conn, idle bool) bool {
-			return true
-		}
-		t.CloseConnections(f)
-		return true
-	}
-	return false
-}
+func CloseConnections(tr http.RoundTripper) {
+	f := func(_ net.Addr) bool { return true }
 
-func CloseConnectionByRemoteAddr(tr http.RoundTripper, addr string) bool {
-	f := func(conn net.Conn, idle bool) bool {
-		return conn != nil && conn.RemoteAddr().String() == addr
-	}
 	switch tr.(type) {
 	case *http.Transport:
-		tr.(*http.Transport).CloseConnections(f)
-		return true
+		tr.(*http.Transport).CloseConnection(f)
 	case *http2.Transport:
-		tr.(*http2.Transport).CloseConnections(f)
-		return true
+		tr.(*http2.Transport).CloseConnection(f)
+	case *h2quic.RoundTripper:
+		tr.(*h2quic.RoundTripper).CloseConnection(f)
+	default:
+		glog.Errorf("%T(%v) has not implement CloseConnection method", tr, tr)
 	}
-	return false
+}
+
+func CloseConnectionByRemoteHost(tr http.RoundTripper, host string) {
+	if host1, _, err := net.SplitHostPort(host); err == nil {
+		host = host1
+	}
+
+	f := func(raddr net.Addr) bool {
+		if host1, _, err := net.SplitHostPort(raddr.String()); err == nil {
+			return host == host1
+		}
+		return false
+	}
+
+	switch tr.(type) {
+	case *http.Transport:
+		tr.(*http.Transport).CloseConnection(f)
+	case *http2.Transport:
+		tr.(*http2.Transport).CloseConnection(f)
+	case *h2quic.RoundTripper:
+		tr.(*h2quic.RoundTripper).CloseConnection(f)
+	default:
+		glog.Errorf("%T(%v) has not implement CloseConnection method", tr, tr)
+	}
 }
 
 func FixRequestURL(req *http.Request) {
@@ -94,4 +104,34 @@ func GetHostName(req *http.Request) string {
 	} else {
 		return req.Host
 	}
+}
+
+func IsStaticRequest(req *http.Request) bool {
+	switch path.Ext(req.URL.Path) {
+	case "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff",
+		"3gp", "3gpp", "avi", "f4v", "flv", "m4p", "mkv", "mp4",
+		"mp4v", "mpv4", "rmvb", ".webp", ".js", ".css":
+		return true
+	case "":
+		name := path.Base(req.URL.Path)
+		if strings.Contains(name, "play") ||
+			strings.Contains(name, "video") {
+			return true
+		}
+	default:
+		if req.Header.Get("Range") != "" ||
+			strings.Contains(req.Host, "img.") ||
+			strings.Contains(req.Host, "cache.") ||
+			strings.Contains(req.Host, "video.") ||
+			strings.Contains(req.Host, "static.") ||
+			strings.HasPrefix(req.Host, "img") ||
+			strings.HasPrefix(req.URL.Path, "/static") ||
+			strings.HasPrefix(req.URL.Path, "/asset") ||
+			strings.Contains(req.URL.Path, "static") ||
+			strings.Contains(req.URL.Path, "asset") ||
+			strings.Contains(req.URL.Path, "/cache/") {
+			return true
+		}
+	}
+	return false
 }

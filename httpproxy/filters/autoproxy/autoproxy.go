@@ -36,10 +36,12 @@ type Config struct {
 		DNSServer       string
 		DNSCacheSize    int
 		Rules           map[string]string
+		IPRules         map[string]string
 	}
 	IndexFiles struct {
-		Enabled bool
-		Files   []string
+		Enabled    bool
+		ServerName string
+		Files      []string
 	}
 	GFWList struct {
 		Enabled  bool
@@ -78,6 +80,7 @@ type Filter struct {
 	Config
 	Store                storage.Store
 	IndexFilesEnabled    bool
+	IndexServerName      string
 	IndexFiles           []string
 	IndexFilesSet        map[string]struct{}
 	ProxyPacCache        lrucache.Cache
@@ -92,6 +95,7 @@ type Filter struct {
 	SiteFiltersRules     *helpers.HostMatcher
 	RegionFiltersEnabled bool
 	RegionFiltersRules   map[string]filters.RoundTripFilter
+	RegionFiltersIPRules map[string]filters.RoundTripFilter
 	RegionResolver       *helpers.Resolver
 	RegionLocator        *ip17mon.Locator
 	RegionFilterCache    lrucache.Cache
@@ -99,25 +103,19 @@ type Filter struct {
 }
 
 func init() {
-	filename := filterName + ".json"
-	config := new(Config)
-	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
-	if err != nil {
-		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
-	}
-
-	err = filters.Register(filterName, &filters.RegisteredFilter{
-		New: func() (filters.Filter, error) {
-			return NewFilter(config)
-		},
-	})
-
-	if err != nil {
-		glog.Fatalf("Register(%#v) error: %s", filterName, err)
-	}
-
 	mime.AddExtensionType(".crt", "application/x-x509-ca-cert")
 	mime.AddExtensionType(".mobileconfig", "application/x-apple-aspen-config")
+
+	filters.Register(filterName, func() (filters.Filter, error) {
+		filename := filterName + ".json"
+		config := new(Config)
+		err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
+		if err != nil {
+			glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
+		}
+
+		return NewFilter(config)
+	})
 }
 
 func NewFilter(config *Config) (_ filters.Filter, err error) {
@@ -147,6 +145,7 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 		Config:               *config,
 		Store:                store,
 		IndexFilesEnabled:    config.IndexFiles.Enabled,
+		IndexServerName:      config.IndexFiles.ServerName,
 		IndexFiles:           config.IndexFiles.Files,
 		IndexFilesSet:        make(map[string]struct{}),
 		ProxyPacCache:        lrucache.NewLRUCache(32),
@@ -223,6 +222,24 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 		}
 		f.RegionFiltersRules = fm
 
+		fm = make(map[string]filters.RoundTripFilter)
+		for ip, name := range config.RegionFilters.IPRules {
+			if name == "" {
+				fm[ip] = nil
+				continue
+			}
+			f, err := filters.GetFilter(name)
+			if err != nil {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) for %#v error: %v", name, ip, err)
+			}
+			f1, ok := f.(filters.RoundTripFilter)
+			if !ok {
+				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) return %T, not a RoundTripFilter", name, f)
+			}
+			fm[ip] = f1
+		}
+		f.RegionFiltersIPRules = fm
+
 		f.RegionFilterCache = lrucache.NewLRUCache(uint(f.Config.RegionFilters.DNSCacheSize))
 	}
 
@@ -294,6 +311,10 @@ func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Contex
 					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
 					filters.SetRoundTripFilter(ctx, f1)
 				}
+			} else if f1, ok := f.RegionFiltersIPRules[ip.String()]; ok {
+				glog.V(2).Infof("%s \"AUTOPROXY RegionFilters IPRules %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
+				f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
+				filters.SetRoundTripFilter(ctx, f1)
 			} else if country, err := f.FindCountryByIP(ip.String()); err == nil {
 				if f1, ok := f.RegionFiltersRules[country]; ok {
 					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters %s %s %s %s\" with %T", req.RemoteAddr, country, req.Method, req.URL.String(), req.Proto, f1)
@@ -329,21 +350,23 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 	}
 
-	if req.URL.Host == "" && req.RequestURI[0] == '/' && f.IndexFilesEnabled {
-		if _, ok := f.IndexFilesSet[req.URL.Path[1:]]; ok || req.URL.Path == "/" {
-			switch {
-			case f.GFWListEnabled && strings.HasSuffix(req.URL.Path, ".pac"):
-				glog.V(2).Infof("%s \"AUTOPROXY ProxyPac %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.ProxyPacRoundTrip(ctx, req)
-			case f.MobileConfigEnabled && strings.HasSuffix(req.URL.Path, ".mobileconfig"):
-				glog.V(2).Infof("%s \"AUTOPROXY ProxyMobileConfig %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.ProxyMobileConfigRoundTrip(ctx, req)
-			case f.IPHTMLEnabled && req.URL.Path == "/ip.html":
-				glog.V(2).Infof("%s \"AUTOPROXY IPHTML %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.IPHTMLRoundTrip(ctx, req)
-			default:
-				glog.V(2).Infof("%s \"AUTOPROXY IndexFiles %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.IndexFilesRoundTrip(ctx, req)
+	if f.IndexFilesEnabled {
+		if (req.URL.Host == "" && req.RequestURI[0] == '/') || (f.IndexServerName != "" && req.Host == f.IndexServerName) {
+			if _, ok := f.IndexFilesSet[req.URL.Path[1:]]; ok || req.URL.Path == "/" {
+				switch {
+				case f.GFWListEnabled && strings.HasSuffix(req.URL.Path, ".pac"):
+					glog.V(2).Infof("%s \"AUTOPROXY ProxyPac %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.ProxyPacRoundTrip(ctx, req)
+				case f.MobileConfigEnabled && strings.HasSuffix(req.URL.Path, ".mobileconfig"):
+					glog.V(2).Infof("%s \"AUTOPROXY ProxyMobileConfig %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.ProxyMobileConfigRoundTrip(ctx, req)
+				case f.IPHTMLEnabled && req.URL.Path == "/ip.html":
+					glog.V(2).Infof("%s \"AUTOPROXY IPHTML %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.IPHTMLRoundTrip(ctx, req)
+				default:
+					glog.V(2).Infof("%s \"AUTOPROXY IndexFiles %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.IndexFilesRoundTrip(ctx, req)
+				}
 			}
 		}
 	}

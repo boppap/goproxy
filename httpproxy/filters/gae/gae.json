@@ -11,12 +11,15 @@
 		"goproxy09-1354",
 		"goproxy10-1354"
 	],
+	"CustomDomains": [
+	],
 	"Password": "",
 	"SSLVerify": true,
 	"DisableIPv6": false,
 	"ForceIPv6": false,
 	"DisableHTTP2": true,
 	"ForceHTTP2": false,
+	"EnableQuic": false,
 	"EnableDeadProbe": true,
 	"EnableRemoteDNS": false,
 	"HostMap" : {
@@ -56,7 +59,7 @@
 		],
 		"google_cn": [
 			"www.g.cn",
-			"www.google.cn"
+			"www.google.cn",
 		]
 	},
 	"SiteToAlias": {
@@ -89,13 +92,22 @@
 		// "*.youtube.com": "google_hk",
 	},
 	"ForceGAE": [
-		"business.google.com",
-		"domains.google.com",
+		// "*.drive.google.com",
+		"appengine.google.com",
 		"books.google.com",
+		"business.google.com",
+		"clients1.google.com",
+		"clients2.google.com",
+		"clients3.google.com",
+		"clients4.google.com",
+		"domains.google.com",
+		"plus.google.com/$",
+		"tools.google.com",
 		"www.google.com/maps",
 		"www.google.com/patents",
-		"plus.google.com/$",
-		"clients1.google.com/ocsp",
+		"youtube.googleapis.com",
+	],
+	"ForceBrotli": [
 	],
 	"TLSConfig": {
 		"Version": "TLSv1.2",
@@ -103,23 +115,27 @@
 		"Ciphers": [
 			"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
 			"TLS_RSA_WITH_AES_128_CBC_SHA256",
+			"TLS_RSA_WITH_AES_256_CBC_SHA256",
 			"TLS_RSA_WITH_3DES_EDE_CBC_SHA",
 		],
 		"ServerName": [
-			"appleid.apple.com",
-			"assets-cdn.github.com",
 			"download.windowsupdate.com",
-			"github.com",
 			"www.apple.com",
 			"www.bing.com",
 			"www.microsoft.com",
-			// "ad.doubleclick.net",
 			// "googleads.g.doubleclick.net",
 			// "pubads.g.doubleclick.net",
 			// "www.google-analytics.com",
+			// "ad.doubleclick.net",
+			// "appleid.apple.com",
+			// "hkg12s09-in-f14.1e100.net",
+			// "hkg12s09-in-f17.1e100.net",
+			// "hkg12s09-in-f3.1e100.net",
+			// "hkg12s09-in-f4.1e100.net",
 		],
 	},
 	"GoogleG2PKP": "7HIpactkIAq2Y49orFOOQKurWxmmSFZhBCoQYcRhJ3Y=",
+	"GoogleG3PKP": "f8NnEFZxQ4ExFOhSN7EiFWtiudZQVD2oY60uauV/n78=",
 	"FakeOptions": {
 		"*": [
 			"Access-Control-Allow-Credentials: true",
@@ -160,14 +176,13 @@
 			"SocketReadBuffer": 0,
 			"DualStack": false,
 			"KeepAlive": 5,
-			"Level": 14,
-			"Timeout": 8,
+			"Level": 20,
+			"Timeout": 5,
 		},
 		"Proxy": {
 			"Enabled": false,
 			"URL": "socks5://127.0.0.1:1080",
 		},
-		"DisableCompression": false,
 		"DisableKeepAlives": false,
 		"IdleConnTimeout": 5,
 		"MaxIdleConnsPerHost": 32,
